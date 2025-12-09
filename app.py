@@ -262,7 +262,7 @@ Deine Aufgabe ist es, aus dem gegebenen Text alle rechtlichen Fälle zu extrahie
 Für jeden Fall extrahiere folgende Informationen (falls vorhanden):
 - kanzlei_az: Kanzlei-Aktenzeichen
 - kurzrubrum: Anonymisiertes Rubrum (z.B. "A ./. B")
-- sachverhalt: Kurze Sachverhaltsbeschreibung
+- sachverhalt: WICHTIG - Inhaltliche Kurzbeschreibung des Falls in 4-6 Sätzen. Beschreibe den rechtlichen Sachverhalt, die Ausgangslage, den Streitgegenstand und ggf. das Ergebnis. Keine Standardfloskeln!
 - zeitraum_von: Beginn (Format: MM/YYYY)
 - zeitraum_bis: Ende (Format: MM/YYYY)
 - gericht_az: Gerichtsaktenzeichen (falls vorhanden)
@@ -337,10 +337,17 @@ Bereiche:
 {bereiche_text}
 
 Analysiere den Fall und gib ein JSON-Objekt mit diesen Feldern zurück:
-- kanzlei_az, kurzrubrum, sachverhalt, zeitraum_von, zeitraum_bis
-- gericht_az, verfahrenstyp, verfahrensart
+- kanzlei_az: Kanzlei-Aktenzeichen (generiere eines falls nicht vorhanden)
+- kurzrubrum: Anonymisiertes Rubrum (z.B. "A ./. B")
+- sachverhalt: WICHTIG - Inhaltliche Kurzbeschreibung in 4-6 Sätzen. Beschreibe Ausgangslage, Streitgegenstand, Verlauf und Ergebnis. Keine Standardfloskeln!
+- zeitraum_von, zeitraum_bis: Format MM/YYYY
+- gericht_az: Gerichtsaktenzeichen (falls vorhanden)
+- verfahrenstyp: "gerichtlich", "rechtsfoermlich" oder "aussergerichtlich"
+- verfahrensart: z.B. "streitig", "fG", "Mahnverfahren"
 - bereich_nr (Integer), bereich_bezeichnung
-- bedeutung, taetigkeitsbeschreibung, stand
+- bedeutung: "gering", "mittel" oder "hoch"
+- taetigkeitsbeschreibung: Konkrete anwaltliche Tätigkeiten
+- stand: "anhaengig" oder "abgeschlossen"
 - abschluss_art, abschluss_datum
 
 Antworte NUR mit JSON, keine Erklärung."""
@@ -676,6 +683,7 @@ def prepare_fl1_for_export(fl1: pd.DataFrame) -> pd.DataFrame:
         "Kurzrubrum": fl1["kurzrubrum"],
         "Kanzlei-AZ": fl1["kanzlei_az"],
         "Gerichts-AZ": fl1["gericht_az"],
+        "Sachverhalt": fl1["sachverhalt"],
         "Bereich-Nr": fl1["bereich_nr"],
         "Bereich-Bezeichnung": fl1["bereich_bezeichnung"],
         "Verfahrenstyp": fl1["verfahrenstyp"],
@@ -697,6 +705,7 @@ def prepare_fl2_for_export(fl2: pd.DataFrame) -> pd.DataFrame:
         "FL2-Nr": fl2["FL2_Nr"],
         "Kurzrubrum": fl2["kurzrubrum"],
         "Kanzlei-AZ": fl2["kanzlei_az"],
+        "Sachverhalt": fl2["sachverhalt"],
         "Bereich-Nr": fl2["bereich_nr"],
         "Bereich-Bezeichnung": fl2["bereich_bezeichnung"],
         "Zeitraum": fl2.apply(lambda x: format_zeitraum(x["zeitraum_von"], x["zeitraum_bis"]), axis=1),
