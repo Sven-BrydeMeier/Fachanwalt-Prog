@@ -16,6 +16,7 @@ from datetime import datetime, date
 from typing import Dict, List, Tuple, Optional, Any
 import json
 import re
+import time
 
 # PDF-Verarbeitung
 try:
@@ -26,7 +27,7 @@ except ImportError:
 
 # OpenAI-Integration
 try:
-    from openai import OpenAI
+    from openai import OpenAI, APIError, APIConnectionError, RateLimitError, APITimeoutError
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
@@ -280,41 +281,58 @@ Antworte NUR mit einem JSON-Array von Objekten. Keine zusätzliche Erklärung.""
 
     user_prompt = f"""Analysiere den folgenden Text und extrahiere alle Fälle im JSON-Format:
 
-{text[:15000]}"""  # Begrenzen auf 15000 Zeichen
+{text[:12000]}"""  # Begrenzen auf 12000 Zeichen für stabilere Verarbeitung
 
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.1,
-            max_tokens=4000
-        )
+    # Retry-Logik für API-Aufrufe
+    max_retries = 3
+    retry_delay = 2  # Sekunden
 
-        content = response.choices[0].message.content.strip()
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=4000,
+                timeout=120  # 2 Minuten Timeout
+            )
 
-        # JSON aus der Antwort extrahieren
-        # Manchmal ist die Antwort in Markdown-Code-Blöcken
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
+            content = response.choices[0].message.content.strip()
 
-        cases = json.loads(content)
+            # JSON aus der Antwort extrahieren
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
 
-        if isinstance(cases, dict):
-            cases = [cases]
+            cases = json.loads(content)
 
-        return cases
+            if isinstance(cases, dict):
+                cases = [cases]
 
-    except json.JSONDecodeError as e:
-        st.error(f"Fehler beim Parsen der GPT-Antwort: {e}")
-        return []
-    except Exception as e:
-        st.error(f"Fehler bei der GPT-Analyse: {e}")
-        return []
+            return cases
+
+        except json.JSONDecodeError as e:
+            st.error(f"Fehler beim Parsen der GPT-Antwort: {e}")
+            return []
+
+        except Exception as e:
+            error_str = str(e).lower()
+            is_retryable = any(x in error_str for x in ["503", "502", "500", "timeout", "overloaded", "rate", "connection"])
+
+            if is_retryable and attempt < max_retries - 1:
+                wait_time = retry_delay * (attempt + 1)
+                st.warning(f"⏳ API-Fehler, wiederhole in {wait_time}s... (Versuch {attempt + 2}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            else:
+                st.error(f"Fehler bei der GPT-Analyse: {e}")
+                return []
+
+    return []
 
 
 def analyze_single_case_with_gpt(
@@ -352,29 +370,46 @@ Analysiere den Fall und gib ein JSON-Objekt mit diesen Feldern zurück:
 
 Antworte NUR mit JSON, keine Erklärung."""
 
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text}
-            ],
-            temperature=0.1,
-            max_tokens=1000
-        )
+    # Retry-Logik
+    max_retries = 3
+    retry_delay = 2
 
-        content = response.choices[0].message.content.strip()
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text}
+                ],
+                temperature=0.1,
+                max_tokens=1500,
+                timeout=60
+            )
 
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
+            content = response.choices[0].message.content.strip()
 
-        return json.loads(content)
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
 
-    except Exception as e:
-        st.error(f"Fehler bei der Einzelfall-Analyse: {e}")
-        return {}
+            return json.loads(content)
+
+        except Exception as e:
+            error_str = str(e).lower()
+            is_retryable = any(x in error_str for x in ["503", "502", "500", "timeout", "overloaded", "rate", "connection"])
+
+            if is_retryable and attempt < max_retries - 1:
+                wait_time = retry_delay * (attempt + 1)
+                st.warning(f"⏳ API-Fehler, wiederhole in {wait_time}s... (Versuch {attempt + 2}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            else:
+                st.error(f"Fehler bei der Einzelfall-Analyse: {e}")
+                return {}
+
+    return {}
 
 
 # =============================================================================
