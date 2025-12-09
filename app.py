@@ -840,7 +840,7 @@ def main():
     )
 
     st.title("⚖️ Fachanwalt-Falllistenverwaltung")
-    st.markdown("**FAO-konforme Falllisten für Fachanwaltsanträge**")
+    st.markdown("**Erstellen Sie FAO-konforme Falllisten für Ihren Fachanwaltsantrag**")
 
     # Session State initialisieren
     if "cases_df" not in st.session_state:
@@ -850,7 +850,7 @@ def main():
 
     # Sidebar
     with st.sidebar:
-        st.header("📋 Einstellungen")
+        st.header("⚙️ Einstellungen")
 
         # Fachgebiet-Auswahl
         fachgebiet = st.selectbox(
@@ -861,158 +861,199 @@ def main():
 
         # OpenAI API-Key Eingabe
         st.markdown("---")
-        st.subheader("🤖 ChatGPT-Integration")
+        st.subheader("🤖 ChatGPT-Verbindung")
 
         api_key = st.text_input(
             "OpenAI API-Key",
             type="password",
             value=st.session_state.openai_api_key,
-            help="Für automatische PDF-Analyse benötigt. Holen Sie sich einen Key unter platform.openai.com"
+            help="Für die automatische Fallanalyse. Key unter platform.openai.com erstellen."
         )
 
         if api_key:
             st.session_state.openai_api_key = api_key
-            st.success("✓ API-Key gespeichert")
+            st.success("✓ API-Key aktiv")
 
         # Modell-Auswahl
         gpt_model = st.selectbox(
             "GPT-Modell",
             options=["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
-            help="gpt-4o-mini ist schnell und günstig, gpt-4o für beste Qualität"
+            help="gpt-4o-mini: schnell & günstig | gpt-4o: beste Qualität"
         )
 
         # Hinweis zu Mindestanforderungen
         st.markdown("---")
-        st.subheader("📌 Anforderungen")
+        st.subheader("📌 FAO-Anforderungen")
         config = FAO_CONFIG[fachgebiet]
         st.markdown(f"**{config['paragraph']}**")
         st.info(config["hinweis"])
 
         if "bereiche" in config:
-            st.markdown("**Bereiche:**")
-            for nr, name in config["bereiche"].items():
-                st.markdown(f"- {nr}. {name}")
+            with st.expander("Bereiche anzeigen"):
+                for nr, name in config["bereiche"].items():
+                    st.markdown(f"**{nr}.** {name}")
 
+        # Optionale Muster-Vorlage
         st.markdown("---")
-
-        # Template-Download
-        st.subheader("📥 Vorlage")
+        st.subheader("📋 Muster-Vorlage")
+        st.caption("Optional: Excel-Muster zum Ansehen des erwarteten Formats")
         template_bytes = create_template_excel()
         st.download_button(
-            label="Excel-Vorlage herunterladen",
+            label="Muster-Excel ansehen",
             data=template_bytes,
-            file_name="fallliste_vorlage.xlsx",
+            file_name="muster_fallliste.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Zeigt das Format, das ChatGPT automatisch aus Ihren PDFs erstellt"
         )
 
-    # Hauptbereich - Tabs für verschiedene Upload-Methoden
-    st.header("📤 Dateien hochladen")
+    # =========================================================================
+    # HAUPTBEREICH
+    # =========================================================================
 
-    upload_tab1, upload_tab2, upload_tab3 = st.tabs([
-        "📄 Excel/CSV Upload",
-        "📕 PDF Upload (mit KI-Analyse)",
-        "✏️ Manueller Fall-Eintrag"
+    # Kurze Erklärung
+    st.markdown("""
+    ### So funktioniert's:
+    1. **PDF-Dateien hochladen** (Mandatsübersichten, Fallberichte, Aktenverzeichnisse)
+    2. **ChatGPT analysiert** automatisch und extrahiert die Falldaten
+    3. **FAO-Check** zeigt, ob alle Anforderungen erfüllt sind
+    4. **Fertige Fallliste herunterladen** zur Einreichung bei der Kammer
+    """)
+
+    st.markdown("---")
+
+    # Tabs für Eingabemethoden - PDF zuerst!
+    tab_pdf, tab_manual = st.tabs([
+        "📕 PDF hochladen (empfohlen)",
+        "✏️ Fall manuell eingeben"
     ])
 
     all_cases = []
 
-    # Tab 1: Excel/CSV Upload
-    with upload_tab1:
-        st.markdown("Laden Sie strukturierte Falldaten im Excel- oder CSV-Format hoch.")
+    # Tab 1: PDF Upload mit KI-Analyse (Hauptmethode)
+    with tab_pdf:
+        st.subheader("PDF-Dokumente mit KI analysieren")
 
-        uploaded_files = st.file_uploader(
-            "Excel/CSV-Dateien auswählen",
-            type=["csv", "xlsx", "xls"],
-            accept_multiple_files=True,
-            key="excel_upload"
-        )
-
-        if uploaded_files:
-            with st.spinner("Dateien werden verarbeitet..."):
-                for file in uploaded_files:
-                    try:
-                        df = load_cases_from_file(file)
-                        df = normalize_case_df(df, fachgebiet)
-                        all_cases.append(df)
-                        st.success(f"✓ {file.name}: {len(df)} Fälle geladen")
-                    except Exception as e:
-                        st.error(f"✗ {file.name}: Fehler - {str(e)}")
-
-    # Tab 2: PDF Upload mit KI-Analyse
-    with upload_tab2:
         if not PDF_AVAILABLE:
-            st.error("⚠️ PyPDF2 ist nicht installiert. Bitte führen Sie aus: `pip install pypdf2`")
+            st.error("⚠️ PyPDF2 fehlt. Installation: `pip install pypdf2`")
         elif not OPENAI_AVAILABLE:
-            st.error("⚠️ OpenAI ist nicht installiert. Bitte führen Sie aus: `pip install openai`")
+            st.error("⚠️ OpenAI fehlt. Installation: `pip install openai`")
         elif not st.session_state.openai_api_key:
-            st.warning("⚠️ Bitte geben Sie Ihren OpenAI API-Key in der Sidebar ein.")
+            st.warning("⚠️ Bitte geben Sie Ihren OpenAI API-Key in der Sidebar ein, um PDFs zu analysieren.")
+            st.markdown("""
+            **So erhalten Sie einen API-Key:**
+            1. Gehen Sie zu [platform.openai.com](https://platform.openai.com)
+            2. Erstellen Sie ein Konto oder melden Sie sich an
+            3. Navigieren Sie zu API Keys → Create new secret key
+            4. Kopieren Sie den Key in das Feld links in der Sidebar
+            """)
         else:
             st.markdown("""
-            Laden Sie PDF-Dokumente hoch (z.B. Mandatsübersichten, Fallberichte).
-            ChatGPT analysiert den Text und extrahiert automatisch die Falldaten.
+            Laden Sie Ihre **Mandatsübersichten, Fallberichte oder Aktenverzeichnisse** hoch.
+            ChatGPT liest die Dokumente und extrahiert automatisch alle relevanten Falldaten.
             """)
 
             pdf_files = st.file_uploader(
                 "PDF-Dateien auswählen",
                 type=["pdf"],
                 accept_multiple_files=True,
-                key="pdf_upload"
+                key="pdf_upload",
+                help="Sie können mehrere PDFs gleichzeitig hochladen"
             )
 
             if pdf_files:
-                client = get_openai_client(st.session_state.openai_api_key)
+                if st.button("🤖 PDFs mit ChatGPT analysieren", type="primary", use_container_width=True):
+                    client = get_openai_client(st.session_state.openai_api_key)
 
-                if client:
-                    for pdf_file in pdf_files:
-                        with st.spinner(f"Analysiere {pdf_file.name} mit ChatGPT..."):
-                            try:
-                                # Text aus PDF extrahieren
-                                pdf_text = extract_text_from_pdf(pdf_file)
+                    if client:
+                        progress_bar = st.progress(0)
+                        for i, pdf_file in enumerate(pdf_files):
+                            with st.spinner(f"Analysiere {pdf_file.name}..."):
+                                try:
+                                    pdf_text = extract_text_from_pdf(pdf_file)
 
-                                if len(pdf_text.strip()) < 50:
-                                    st.warning(f"⚠️ {pdf_file.name}: Wenig Text extrahiert. Möglicherweise ein gescanntes PDF.")
-                                    continue
+                                    if len(pdf_text.strip()) < 50:
+                                        st.warning(f"⚠️ {pdf_file.name}: Wenig Text gefunden. Gescanntes PDF?")
+                                        continue
 
-                                # Mit ChatGPT analysieren
-                                cases = analyze_cases_with_gpt(
-                                    client,
-                                    pdf_text,
-                                    fachgebiet,
-                                    model=gpt_model
-                                )
+                                    cases = analyze_cases_with_gpt(
+                                        client,
+                                        pdf_text,
+                                        fachgebiet,
+                                        model=gpt_model
+                                    )
 
-                                if cases:
-                                    df = cases_list_to_dataframe(cases)
-                                    df = normalize_case_df(df, fachgebiet)
-                                    all_cases.append(df)
-                                    st.success(f"✓ {pdf_file.name}: {len(cases)} Fälle erkannt")
+                                    if cases:
+                                        df = cases_list_to_dataframe(cases)
+                                        df = normalize_case_df(df, fachgebiet)
+                                        all_cases.append(df)
+                                        st.success(f"✓ {pdf_file.name}: **{len(cases)} Fälle** erkannt")
 
-                                    # Vorschau der erkannten Fälle
-                                    with st.expander(f"Erkannte Fälle aus {pdf_file.name}"):
-                                        st.dataframe(df[["kurzrubrum", "verfahrenstyp", "bereich_nr", "bedeutung"]])
-                                else:
-                                    st.warning(f"⚠️ {pdf_file.name}: Keine Fälle erkannt")
+                                        with st.expander(f"Details: {pdf_file.name}"):
+                                            st.dataframe(
+                                                df[["kurzrubrum", "verfahrenstyp", "bereich_nr", "bedeutung"]],
+                                                use_container_width=True,
+                                                hide_index=True
+                                            )
+                                    else:
+                                        st.warning(f"⚠️ {pdf_file.name}: Keine Fälle erkannt")
 
-                            except Exception as e:
-                                st.error(f"✗ {pdf_file.name}: {str(e)}")
+                                except Exception as e:
+                                    st.error(f"✗ {pdf_file.name}: {str(e)}")
 
-    # Tab 3: Manueller Eintrag
-    with upload_tab3:
-        st.markdown("Geben Sie einen Fall manuell ein oder beschreiben Sie ihn für die KI-Analyse.")
+                            progress_bar.progress((i + 1) / len(pdf_files))
+
+    # Tab 2: Manueller Eintrag
+    with tab_manual:
+        st.subheader("Einzelnen Fall eingeben")
 
         manual_method = st.radio(
-            "Eingabemethode",
-            ["Strukturierte Eingabe", "Freitext (KI-Analyse)"],
-            horizontal=True
+            "Eingabeart",
+            ["Freitext (KI-Analyse)", "Strukturierte Eingabe"],
+            horizontal=True,
+            help="Freitext: Beschreiben Sie den Fall, ChatGPT füllt die Felder aus"
         )
 
-        if manual_method == "Strukturierte Eingabe":
+        if manual_method == "Freitext (KI-Analyse)":
+            if not st.session_state.openai_api_key:
+                st.warning("⚠️ Für die KI-Analyse bitte OpenAI API-Key in der Sidebar eingeben.")
+            else:
+                freitext = st.text_area(
+                    "Fallbeschreibung",
+                    placeholder="""Beschreiben Sie den Fall frei, z.B.:
+
+Im Januar 2024 beauftragte mich Mandant A mit der Durchsetzung seiner Erbansprüche gegen die Erbengemeinschaft B, C und D. Es ging um ein Nachlassvermögen von ca. 500.000 EUR. Nach außergerichtlicher Korrespondenz und gescheiterten Vergleichsverhandlungen erhob ich Klage beim LG München (Az. 12 O 4567/24). Das Verfahren endete im Juni 2024 durch Vergleich.""",
+                    height=200
+                )
+
+                if st.button("🤖 Mit ChatGPT analysieren", type="primary"):
+                    if freitext:
+                        client = get_openai_client(st.session_state.openai_api_key)
+                        if client:
+                            with st.spinner("ChatGPT analysiert..."):
+                                case_data = analyze_single_case_with_gpt(
+                                    client, freitext, fachgebiet, gpt_model
+                                )
+
+                                if case_data:
+                                    new_df = pd.DataFrame([case_data])
+                                    new_df = normalize_case_df(new_df, fachgebiet)
+                                    all_cases.append(new_df)
+                                    st.success("✓ Fall erkannt und hinzugefügt!")
+
+                                    with st.expander("Erkannte Daten"):
+                                        st.json(case_data)
+                    else:
+                        st.warning("Bitte geben Sie eine Fallbeschreibung ein.")
+
+        else:  # Strukturierte Eingabe
+            st.markdown("Füllen Sie die Felder manuell aus:")
+
             col1, col2 = st.columns(2)
 
             with col1:
                 m_kanzlei_az = st.text_input("Kanzlei-AZ", placeholder="2024/001")
                 m_kurzrubrum = st.text_input("Kurzrubrum", placeholder="A ./. B")
-                m_sachverhalt = st.text_area("Sachverhalt", placeholder="Kurze Beschreibung...")
+                m_sachverhalt = st.text_area("Sachverhalt", placeholder="Kurze Beschreibung...", height=100)
                 m_zeitraum_von = st.text_input("Zeitraum von", placeholder="01/2024")
                 m_zeitraum_bis = st.text_input("Zeitraum bis", placeholder="06/2024")
                 m_gericht_az = st.text_input("Gerichts-AZ", placeholder="12 O 123/24")
@@ -1026,7 +1067,7 @@ def main():
                 m_bedeutung = st.selectbox("Bedeutung", ["gering", "mittel", "hoch"])
                 m_stand = st.selectbox("Stand", ["abgeschlossen", "anhaengig"])
 
-            m_taetigkeit = st.text_area("Tätigkeitsbeschreibung", placeholder="Beratung, Verhandlung, ...")
+            m_taetigkeit = st.text_area("Tätigkeitsbeschreibung", placeholder="Beratung, Klageschrift, Verhandlung...", height=80)
 
             col3, col4 = st.columns(2)
             with col3:
@@ -1059,57 +1100,9 @@ def main():
                 all_cases.append(new_df)
                 st.success("✓ Fall hinzugefügt!")
 
-        else:  # Freitext mit KI
-            if not st.session_state.openai_api_key:
-                st.warning("⚠️ Für KI-Analyse bitte OpenAI API-Key in der Sidebar eingeben.")
-            else:
-                freitext = st.text_area(
-                    "Fall-Beschreibung",
-                    placeholder="Beschreiben Sie den Fall frei, z.B.:\n\nMandant A beauftragte mich im Januar 2024 mit der Durchsetzung seiner Erbansprüche gegen die Erbengemeinschaft...",
-                    height=200
-                )
-
-                if st.button("🤖 Mit ChatGPT analysieren", type="primary"):
-                    if freitext:
-                        client = get_openai_client(st.session_state.openai_api_key)
-                        if client:
-                            with st.spinner("ChatGPT analysiert..."):
-                                case_data = analyze_single_case_with_gpt(
-                                    client, freitext, fachgebiet, gpt_model
-                                )
-
-                                if case_data:
-                                    new_df = pd.DataFrame([case_data])
-                                    new_df = normalize_case_df(new_df, fachgebiet)
-                                    all_cases.append(new_df)
-                                    st.success("✓ Fall erkannt und hinzugefügt!")
-                                    st.json(case_data)
-                    else:
-                        st.warning("Bitte geben Sie eine Fallbeschreibung ein.")
-
-    # Fälle zusammenführen und anzeigen
-    if not all_cases and st.session_state.cases_df.empty:
-        st.info("👈 Laden Sie Dateien hoch oder geben Sie Fälle manuell ein.")
-
-        with st.expander("📖 Anleitung"):
-            st.markdown("""
-            ### Verwendung:
-
-            1. **Fachgebiet wählen** (Sidebar)
-            2. **OpenAI API-Key eingeben** (für PDF-Analyse)
-            3. **Dateien hochladen:**
-               - **Excel/CSV**: Strukturierte Falldaten
-               - **PDF**: Automatische Analyse mit ChatGPT
-               - **Manuell**: Einzelne Fälle eingeben
-            4. **Ergebnis prüfen** und **Excel exportieren**
-
-            ### PDF-Analyse:
-            Die KI liest Ihre PDFs und extrahiert automatisch:
-            - Aktenzeichen, Parteien, Zeiträume
-            - Verfahrenstyp und -art
-            - Fachbereich und Bedeutung
-            """)
-        return
+    # =========================================================================
+    # FÄLLE VERARBEITEN UND ANZEIGEN
+    # =========================================================================
 
     # Alle neuen Fälle mit bestehenden kombinieren
     if all_cases:
@@ -1122,7 +1115,10 @@ def main():
         else:
             st.session_state.cases_df = new_combined
 
+    # Wenn keine Fälle vorhanden
     if st.session_state.cases_df.empty:
+        st.markdown("---")
+        st.info("👆 Laden Sie PDFs hoch oder geben Sie Fälle manuell ein, um Ihre Fallliste zu erstellen.")
         return
 
     # Nach Fachgebiet filtern
@@ -1132,7 +1128,10 @@ def main():
 
     if len(filtered_df) == 0:
         filtered_df = st.session_state.cases_df.copy()
-        st.info(f"Keine Fälle für '{fachgebiet}' gefunden. Zeige alle {len(filtered_df)} Fälle.")
+
+    # =========================================================================
+    # ERGEBNISSE ANZEIGEN
+    # =========================================================================
 
     st.markdown("---")
 
@@ -1140,45 +1139,57 @@ def main():
     fl1, fl2 = split_into_falllisten(filtered_df)
     summary = compute_summary(filtered_df, fachgebiet)
 
-    # Dashboard
-    st.header("📊 Dashboard")
+    # Dashboard mit Kennzahlen
+    st.header("📊 Ihre Fallliste - Übersicht")
 
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
+        delta_gesamt = summary["gesamt"] - FAO_CONFIG[fachgebiet]['gesamt_min']
         st.metric(
             label="Gesamtfälle",
             value=summary["gesamt"],
-            delta=f"Soll: {FAO_CONFIG[fachgebiet]['gesamt_min']}"
+            delta=f"{delta_gesamt:+d} zum Soll" if delta_gesamt != 0 else "Soll erreicht",
+            delta_color="normal" if delta_gesamt >= 0 else "inverse"
         )
 
     with col2:
+        soll_ger = FAO_CONFIG[fachgebiet].get('gerichtlich_min', 0)
+        delta_ger = summary["gerichtlich"] - soll_ger
         st.metric(
-            label="Gerichtlich/Rechtsförmlich",
+            label="Gerichtlich",
             value=summary["gerichtlich"],
-            delta=f"Soll: {FAO_CONFIG[fachgebiet].get('gerichtlich_min', 0)}"
+            delta=f"{delta_ger:+d}" if soll_ger > 0 else None,
+            delta_color="normal" if delta_ger >= 0 else "inverse"
         )
 
     with col3:
-        st.metric(
-            label="Außergerichtlich",
-            value=summary["aussergerichtlich"],
-            delta=f"Soll: {FAO_CONFIG[fachgebiet].get('aussergerichtlich_min', 0)}" if FAO_CONFIG[fachgebiet].get('aussergerichtlich_min', 0) > 0 else None
-        )
+        soll_ag = FAO_CONFIG[fachgebiet].get('aussergerichtlich_min', 0)
+        if soll_ag > 0:
+            delta_ag = summary["aussergerichtlich"] - soll_ag
+            st.metric(
+                label="Außergerichtlich",
+                value=summary["aussergerichtlich"],
+                delta=f"{delta_ag:+d}",
+                delta_color="normal" if delta_ag >= 0 else "inverse"
+            )
+        else:
+            st.metric(label="Außergerichtlich", value=summary["aussergerichtlich"])
 
     with col4:
         erfuellt_count = sum(1 for c in summary["checks"] if c[3] == "erfuellt")
         total_checks = len(summary["checks"])
         st.metric(
-            label="FAO-Kriterien erfüllt",
+            label="FAO-Kriterien",
             value=f"{erfuellt_count}/{total_checks}",
-            delta="Alle erfüllt" if erfuellt_count == total_checks else f"{total_checks - erfuellt_count} offen"
+            delta="Alle erfüllt ✓" if erfuellt_count == total_checks else f"{total_checks - erfuellt_count} offen"
         )
 
     st.markdown("---")
 
-    # FAO-Check
+    # FAO-Konformitätscheck
     st.header("✅ FAO-Konformitätscheck")
+
     check_cols = st.columns(2)
 
     for i, check in enumerate(summary["checks"]):
@@ -1193,6 +1204,13 @@ def main():
                 st.warning(f"{symbol} **{kriterium}**: {ist}/{soll}")
             else:
                 st.error(f"{symbol} **{kriterium}**: {ist}/{soll}")
+
+    # Warnungen (falls vorhanden)
+    if summary["warnungen"]:
+        st.markdown("---")
+        st.subheader("⚠️ Hinweise")
+        for warnung in summary["warnungen"]:
+            st.warning(warnung)
 
     # Bereichsverteilung
     st.markdown("---")
@@ -1212,32 +1230,25 @@ def main():
         bereich_df = pd.DataFrame(bereich_data)
         st.bar_chart(bereich_df.set_index("Bereich"))
 
-    # Warnungen
-    if summary["warnungen"]:
-        st.markdown("---")
-        st.header("⚠️ Warnungen")
-        for warnung in summary["warnungen"]:
-            st.warning(warnung)
-
     # Falllisten-Vorschau
     st.markdown("---")
-    st.header("📋 Falllisten-Vorschau")
+    st.header("📋 Vorschau der Falllisten")
 
-    tab1, tab2 = st.tabs([
-        f"Fallliste 1 - Gerichtlich ({len(fl1)} Fälle)",
-        f"Fallliste 2 - Außergerichtlich ({len(fl2)} Fälle)"
+    preview_tab1, preview_tab2 = st.tabs([
+        f"Fallliste 1 - Gerichtlich/Rechtsförmlich ({len(fl1)})",
+        f"Fallliste 2 - Außergerichtlich ({len(fl2)})"
     ])
 
-    with tab1:
+    with preview_tab1:
         if len(fl1) > 0:
             display_cols = ["FL1_Nr", "kurzrubrum", "kanzlei_az", "gericht_az",
                           "bereich_nr", "verfahrenstyp", "bedeutung", "stand"]
             display_cols = [c for c in display_cols if c in fl1.columns]
             st.dataframe(fl1[display_cols], use_container_width=True, hide_index=True)
         else:
-            st.info("Keine gerichtlichen Verfahren vorhanden.")
+            st.info("Keine gerichtlichen/rechtsförmlichen Verfahren vorhanden.")
 
-    with tab2:
+    with preview_tab2:
         if len(fl2) > 0:
             display_cols = ["FL2_Nr", "kurzrubrum", "kanzlei_az", "bereich_nr", "bedeutung"]
             display_cols = [c for c in display_cols if c in fl2.columns]
@@ -1245,31 +1256,42 @@ def main():
         else:
             st.info("Keine außergerichtlichen Verfahren vorhanden.")
 
-    # Export
+    # =========================================================================
+    # EXPORT - FERTIGE FALLLISTE ZUM EINREICHEN
+    # =========================================================================
+
     st.markdown("---")
-    st.header("📥 Export")
+    st.header("📥 Fertige Fallliste herunterladen")
+
+    st.markdown("""
+    Die Excel-Datei enthält Ihre **einreichungsfertige Fallliste** mit:
+    - **Fallliste 1**: Gerichtliche/rechtsförmliche Verfahren
+    - **Fallliste 2**: Außergerichtliche Verfahren
+    - **Summary**: Übersicht mit FAO-Check und Statistiken
+    """)
 
     excel_bytes = create_excel(fl1, fl2, summary, fachgebiet)
-    filename = f"fallliste_{fachgebiet.lower().replace(' ', '_').replace('-', '_')}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+    filename = f"Fallliste_{fachgebiet.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
-    col1, col2, col3 = st.columns([1, 1, 2])
+    col1, col2, col3 = st.columns([2, 1, 1])
 
     with col1:
         st.download_button(
-            label="📥 Excel herunterladen",
+            label="📥 FALLLISTE HERUNTERLADEN (Excel)",
             data=excel_bytes,
             file_name=filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary"
+            type="primary",
+            use_container_width=True
         )
 
     with col2:
-        if st.button("🗑️ Alle Fälle löschen"):
-            st.session_state.cases_df = pd.DataFrame()
-            st.rerun()
+        st.metric("Fälle gesamt", summary["gesamt"])
 
     with col3:
-        st.info("Die Excel enthält 3 Blätter: Fallliste_1, Fallliste_2, Summary")
+        if st.button("🗑️ Zurücksetzen", help="Alle Fälle löschen und neu beginnen"):
+            st.session_state.cases_df = pd.DataFrame()
+            st.rerun()
 
 
 if __name__ == "__main__":
