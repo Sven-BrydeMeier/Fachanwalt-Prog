@@ -9,6 +9,11 @@ Verwendung: streamlit run app.py
 Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 """
 
+# =============================================================================
+# VERSION
+# =============================================================================
+APP_VERSION = "25.12.09-22:09"
+
 import streamlit as st
 import pandas as pd
 from io import BytesIO
@@ -1119,6 +1124,7 @@ def main():
     )
 
     st.title("⚖️ Fachanwalt-Falllistenverwaltung")
+    st.caption(f"Version {APP_VERSION}")
     st.markdown("**Erstellen Sie FAO-konforme Falllisten für Ihren Fachanwaltsantrag**")
 
     # Session State initialisieren
