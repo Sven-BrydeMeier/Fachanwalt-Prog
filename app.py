@@ -17,6 +17,23 @@ from typing import Dict, List, Tuple, Optional, Any
 import json
 import re
 import time
+import requests
+from urllib.parse import urlparse, parse_qs
+
+# =============================================================================
+# UPLOAD-LIMITS FÜR STREAMLIT CLOUD
+# =============================================================================
+
+# Maximale Dateigröße pro Upload in Bytes (50 MB für Stabilität)
+MAX_FILE_SIZE_MB = 50
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
+# Maximale Gesamtgröße aller Uploads in einer Session (200 MB)
+MAX_TOTAL_UPLOAD_MB = 200
+MAX_TOTAL_UPLOAD_BYTES = MAX_TOTAL_UPLOAD_MB * 1024 * 1024
+
+# Chunk-Größe für Cloud-Downloads (5 MB)
+CLOUD_CHUNK_SIZE = 5 * 1024 * 1024
 
 # PDF-Verarbeitung
 try:
@@ -218,6 +235,224 @@ def extract_text_from_pdf(file) -> str:
     for page in reader.pages:
         text += page.extract_text() + "\n"
     return text
+
+
+def check_file_size(file) -> Tuple[bool, str]:
+    """
+    Prüft ob eine Datei das Upload-Limit überschreitet.
+
+    Returns:
+        Tuple[bool, str]: (ist_ok, fehlermeldung)
+    """
+    try:
+        # Dateigröße ermitteln
+        file.seek(0, 2)  # Ans Ende springen
+        file_size = file.tell()
+        file.seek(0)  # Zurück zum Anfang
+
+        if file_size > MAX_FILE_SIZE_BYTES:
+            size_mb = file_size / (1024 * 1024)
+            return False, f"Datei zu groß: {size_mb:.1f} MB (max. {MAX_FILE_SIZE_MB} MB erlaubt)"
+
+        return True, ""
+    except Exception as e:
+        return False, f"Fehler bei Größenprüfung: {str(e)}"
+
+
+def check_total_upload_size(files: List) -> Tuple[bool, str, float]:
+    """
+    Prüft ob die Gesamtgröße aller Dateien das Limit überschreitet.
+
+    Returns:
+        Tuple[bool, str, float]: (ist_ok, fehlermeldung, gesamtgroesse_mb)
+    """
+    total_size = 0
+    for f in files:
+        try:
+            f.seek(0, 2)
+            total_size += f.tell()
+            f.seek(0)
+        except:
+            pass
+
+    total_mb = total_size / (1024 * 1024)
+
+    if total_size > MAX_TOTAL_UPLOAD_BYTES:
+        return False, f"Gesamtgröße zu hoch: {total_mb:.1f} MB (max. {MAX_TOTAL_UPLOAD_MB} MB)", total_mb
+
+    return True, "", total_mb
+
+
+# =============================================================================
+# CLOUD-DRIVE INTEGRATION (iCloud, Google Drive)
+# =============================================================================
+
+def parse_cloud_link(url: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Erkennt und parst Cloud-Drive Freigabe-Links.
+
+    Returns:
+        Tuple[Optional[str], Optional[str]]: (provider, download_url oder file_id)
+    """
+    url = url.strip()
+    parsed = urlparse(url)
+
+    # Google Drive
+    if "drive.google.com" in parsed.netloc:
+        # Format: https://drive.google.com/file/d/FILE_ID/view
+        if "/file/d/" in url:
+            parts = url.split("/file/d/")
+            if len(parts) > 1:
+                file_id = parts[1].split("/")[0].split("?")[0]
+                return "google_drive", file_id
+        # Format: https://drive.google.com/open?id=FILE_ID
+        elif "id=" in url:
+            query = parse_qs(parsed.query)
+            if "id" in query:
+                return "google_drive", query["id"][0]
+
+    # iCloud
+    if "icloud.com" in parsed.netloc:
+        # iCloud-Links müssen über die API aufgelöst werden
+        return "icloud", url
+
+    # Dropbox
+    if "dropbox.com" in parsed.netloc:
+        # Dropbox-Links auf direkten Download umwandeln
+        if "dl=0" in url:
+            direct_url = url.replace("dl=0", "dl=1")
+        elif "dl=1" not in url:
+            direct_url = url + ("&dl=1" if "?" in url else "?dl=1")
+        else:
+            direct_url = url
+        return "dropbox", direct_url
+
+    return None, None
+
+
+def download_from_google_drive(file_id: str, progress_callback=None) -> Optional[BytesIO]:
+    """
+    Lädt eine Datei von Google Drive herunter (öffentliche Freigabe).
+    Unterstützt Chunk-basiertes Laden für große Dateien.
+    """
+    # Direkt-Download-URL
+    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    try:
+        session = requests.Session()
+
+        # Erste Anfrage - prüft auf Virenwarnungsseite bei großen Dateien
+        response = session.get(download_url, stream=True, timeout=30)
+
+        # Google Drive Virenscan-Warnung umgehen
+        for key, value in response.cookies.items():
+            if key.startswith('download_warning'):
+                download_url = f"https://drive.google.com/uc?export=download&confirm={value}&id={file_id}"
+                response = session.get(download_url, stream=True, timeout=30)
+                break
+
+        if response.status_code != 200:
+            return None
+
+        # Content-Length prüfen
+        content_length = response.headers.get('content-length')
+        if content_length:
+            file_size = int(content_length)
+            if file_size > MAX_TOTAL_UPLOAD_BYTES:
+                raise ValueError(f"Datei zu groß: {file_size / (1024*1024):.1f} MB")
+
+        # Chunk-basiertes Laden
+        buffer = BytesIO()
+        downloaded = 0
+
+        for chunk in response.iter_content(chunk_size=CLOUD_CHUNK_SIZE):
+            if chunk:
+                buffer.write(chunk)
+                downloaded += len(chunk)
+
+                # Größenlimit prüfen
+                if downloaded > MAX_TOTAL_UPLOAD_BYTES:
+                    raise ValueError(f"Download überschreitet Limit von {MAX_TOTAL_UPLOAD_MB} MB")
+
+                # Progress-Callback
+                if progress_callback and content_length:
+                    progress_callback(downloaded / int(content_length))
+
+        buffer.seek(0)
+        return buffer
+
+    except requests.RequestException as e:
+        st.error(f"Download-Fehler: {str(e)}")
+        return None
+    except ValueError as e:
+        st.error(str(e))
+        return None
+
+
+def download_from_dropbox(url: str, progress_callback=None) -> Optional[BytesIO]:
+    """
+    Lädt eine Datei von Dropbox herunter.
+    """
+    try:
+        response = requests.get(url, stream=True, timeout=60)
+
+        if response.status_code != 200:
+            return None
+
+        content_length = response.headers.get('content-length')
+        if content_length and int(content_length) > MAX_TOTAL_UPLOAD_BYTES:
+            raise ValueError(f"Datei zu groß: {int(content_length) / (1024*1024):.1f} MB")
+
+        buffer = BytesIO()
+        downloaded = 0
+
+        for chunk in response.iter_content(chunk_size=CLOUD_CHUNK_SIZE):
+            if chunk:
+                buffer.write(chunk)
+                downloaded += len(chunk)
+
+                if downloaded > MAX_TOTAL_UPLOAD_BYTES:
+                    raise ValueError(f"Download überschreitet Limit von {MAX_TOTAL_UPLOAD_MB} MB")
+
+                if progress_callback and content_length:
+                    progress_callback(downloaded / int(content_length))
+
+        buffer.seek(0)
+        return buffer
+
+    except Exception as e:
+        st.error(f"Dropbox-Download-Fehler: {str(e)}")
+        return None
+
+
+def download_from_cloud(url: str, progress_callback=None) -> Tuple[Optional[BytesIO], str]:
+    """
+    Universelle Funktion zum Download von Cloud-Speichern.
+
+    Returns:
+        Tuple[Optional[BytesIO], str]: (datei_buffer, fehlermeldung)
+    """
+    provider, identifier = parse_cloud_link(url)
+
+    if provider is None:
+        return None, "Unbekannter Cloud-Anbieter. Unterstützt: Google Drive, Dropbox, iCloud"
+
+    if provider == "google_drive":
+        buffer = download_from_google_drive(identifier, progress_callback)
+        if buffer:
+            return buffer, ""
+        return None, "Google Drive Download fehlgeschlagen. Ist die Datei öffentlich freigegeben?"
+
+    if provider == "dropbox":
+        buffer = download_from_dropbox(identifier, progress_callback)
+        if buffer:
+            return buffer, ""
+        return None, "Dropbox Download fehlgeschlagen. Prüfen Sie die Freigabe-Einstellungen."
+
+    if provider == "icloud":
+        return None, "iCloud-Links werden derzeit nicht direkt unterstützt. Bitte laden Sie die Datei herunter und nutzen Sie den normalen Upload."
+
+    return None, "Download nicht möglich"
 
 
 # =============================================================================
@@ -966,8 +1201,9 @@ def main():
     st.markdown("---")
 
     # Tabs für Eingabemethoden - PDF zuerst!
-    tab_pdf, tab_manual = st.tabs([
+    tab_pdf, tab_cloud, tab_manual = st.tabs([
         "📕 PDF hochladen (empfohlen)",
+        "☁️ Cloud-Link (Google Drive/Dropbox)",
         "✏️ Fall manuell eingeben"
     ])
 
@@ -976,6 +1212,9 @@ def main():
     # Tab 1: PDF Upload mit KI-Analyse (Hauptmethode)
     with tab_pdf:
         st.subheader("PDF-Dokumente mit KI analysieren")
+
+        # Upload-Limit-Hinweis
+        st.info(f"📦 **Upload-Limit:** Max. {MAX_FILE_SIZE_MB} MB pro Datei, {MAX_TOTAL_UPLOAD_MB} MB gesamt")
 
         if not PDF_AVAILABLE:
             st.error("⚠️ PyPDF2 fehlt. Installation: `pip install pypdf2`")
@@ -994,6 +1233,8 @@ def main():
             st.markdown("""
             Laden Sie Ihre **Mandatsübersichten, Fallberichte oder Aktenverzeichnisse** hoch.
             ChatGPT liest die Dokumente und extrahiert automatisch alle relevanten Falldaten.
+
+            **Bei größeren Datenmengen:** Nutzen Sie den Cloud-Link Tab für Google Drive oder Dropbox.
             """)
 
             pdf_files = st.file_uploader(
@@ -1001,50 +1242,182 @@ def main():
                 type=["pdf"],
                 accept_multiple_files=True,
                 key="pdf_upload",
-                help="Sie können mehrere PDFs gleichzeitig hochladen"
+                help=f"Sie können mehrere PDFs hochladen (max. {MAX_FILE_SIZE_MB} MB pro Datei)"
             )
 
             if pdf_files:
-                if st.button("🤖 PDFs mit ChatGPT analysieren", type="primary", use_container_width=True):
-                    client = get_openai_client(st.session_state.openai_api_key)
+                # Dateigrößen prüfen
+                files_to_process = []
+                rejected_files = []
 
-                    if client:
-                        progress_bar = st.progress(0)
-                        for i, pdf_file in enumerate(pdf_files):
-                            with st.spinner(f"Analysiere {pdf_file.name}..."):
+                for pdf_file in pdf_files:
+                    is_ok, error_msg = check_file_size(pdf_file)
+                    if is_ok:
+                        files_to_process.append(pdf_file)
+                    else:
+                        rejected_files.append((pdf_file.name, error_msg))
+
+                # Gesamtgröße prüfen
+                if files_to_process:
+                    total_ok, total_error, total_mb = check_total_upload_size(files_to_process)
+                    st.caption(f"Gesamtgröße: {total_mb:.1f} MB von {MAX_TOTAL_UPLOAD_MB} MB")
+
+                    if not total_ok:
+                        st.error(f"⚠️ {total_error}")
+                        st.warning("Tipp: Nutzen Sie den **Cloud-Link Tab** für große Datenmengen!")
+                        files_to_process = []
+
+                # Abgelehnte Dateien anzeigen
+                if rejected_files:
+                    st.error("❌ Folgende Dateien wurden abgelehnt (zu groß):")
+                    for filename, error in rejected_files:
+                        st.markdown(f"- **{filename}**: {error}")
+                    st.warning("Tipp: Nutzen Sie den **Cloud-Link Tab** für Google Drive oder Dropbox!")
+
+                if files_to_process:
+                    if st.button("🤖 PDFs mit ChatGPT analysieren", type="primary", use_container_width=True):
+                        client = get_openai_client(st.session_state.openai_api_key)
+
+                        if client:
+                            progress_bar = st.progress(0)
+                            for i, pdf_file in enumerate(files_to_process):
+                                with st.spinner(f"Analysiere {pdf_file.name}..."):
+                                    try:
+                                        pdf_text = extract_text_from_pdf(pdf_file)
+
+                                        if len(pdf_text.strip()) < 50:
+                                            st.warning(f"⚠️ {pdf_file.name}: Wenig Text gefunden. Gescanntes PDF?")
+                                            continue
+
+                                        cases = analyze_cases_with_gpt(
+                                            client,
+                                            pdf_text,
+                                            fachgebiet,
+                                            model=gpt_model
+                                        )
+
+                                        if cases:
+                                            df = cases_list_to_dataframe(cases)
+                                            df = normalize_case_df(df, fachgebiet)
+                                            all_cases.append(df)
+                                            st.success(f"✓ {pdf_file.name}: **{len(cases)} Fälle** erkannt")
+
+                                            with st.expander(f"Details: {pdf_file.name}"):
+                                                st.dataframe(
+                                                    df[["kurzrubrum", "verfahrenstyp", "bereich_nr", "bedeutung"]],
+                                                    use_container_width=True,
+                                                    hide_index=True
+                                                )
+                                        else:
+                                            st.warning(f"⚠️ {pdf_file.name}: Keine Fälle erkannt")
+
+                                    except Exception as e:
+                                        st.error(f"✗ {pdf_file.name}: {str(e)}")
+
+                                progress_bar.progress((i + 1) / len(files_to_process))
+
+    # Tab 2: Cloud-Link Upload (Google Drive, Dropbox, iCloud)
+    with tab_cloud:
+        st.subheader("PDF von Cloud-Speicher laden")
+
+        st.markdown("""
+        **Ideal für große Datenmengen!** Die Dateien werden in Paketen heruntergeladen und verarbeitet.
+
+        **Unterstützte Anbieter:**
+        - **Google Drive**: Datei freigeben → "Jeder mit dem Link" → Link kopieren
+        - **Dropbox**: Datei freigeben → Link kopieren
+        - **iCloud**: *Derzeit nicht direkt unterstützt* (bitte Datei herunterladen und normal hochladen)
+        """)
+
+        if not st.session_state.openai_api_key:
+            st.warning("⚠️ Bitte geben Sie Ihren OpenAI API-Key in der Sidebar ein.")
+        else:
+            cloud_url = st.text_input(
+                "Freigabe-Link eingeben",
+                placeholder="https://drive.google.com/file/d/... oder https://www.dropbox.com/...",
+                help="Der Link muss öffentlich zugänglich sein (Freigabe für 'Jeder mit dem Link')"
+            )
+
+            if cloud_url:
+                # Link prüfen
+                provider, identifier = parse_cloud_link(cloud_url)
+
+                if provider:
+                    st.success(f"✓ Erkannt: **{provider.replace('_', ' ').title()}**")
+
+                    if st.button("☁️ Von Cloud laden und analysieren", type="primary", use_container_width=True):
+                        with st.spinner("Lade Datei von Cloud..."):
+                            progress_placeholder = st.empty()
+
+                            def update_progress(progress):
+                                progress_placeholder.progress(progress, text=f"Download: {progress*100:.0f}%")
+
+                            buffer, error = download_from_cloud(cloud_url, update_progress)
+
+                            if buffer:
+                                progress_placeholder.empty()
+                                st.success("✓ Download abgeschlossen!")
+
+                                # Prüfen ob PDF
                                 try:
-                                    pdf_text = extract_text_from_pdf(pdf_file)
+                                    with st.spinner("Extrahiere Text aus PDF..."):
+                                        pdf_text = extract_text_from_pdf(buffer)
 
                                     if len(pdf_text.strip()) < 50:
-                                        st.warning(f"⚠️ {pdf_file.name}: Wenig Text gefunden. Gescanntes PDF?")
-                                        continue
-
-                                    cases = analyze_cases_with_gpt(
-                                        client,
-                                        pdf_text,
-                                        fachgebiet,
-                                        model=gpt_model
-                                    )
-
-                                    if cases:
-                                        df = cases_list_to_dataframe(cases)
-                                        df = normalize_case_df(df, fachgebiet)
-                                        all_cases.append(df)
-                                        st.success(f"✓ {pdf_file.name}: **{len(cases)} Fälle** erkannt")
-
-                                        with st.expander(f"Details: {pdf_file.name}"):
-                                            st.dataframe(
-                                                df[["kurzrubrum", "verfahrenstyp", "bereich_nr", "bedeutung"]],
-                                                use_container_width=True,
-                                                hide_index=True
-                                            )
+                                        st.warning("⚠️ Wenig Text gefunden. Gescanntes PDF?")
                                     else:
-                                        st.warning(f"⚠️ {pdf_file.name}: Keine Fälle erkannt")
+                                        client = get_openai_client(st.session_state.openai_api_key)
+
+                                        if client:
+                                            # Text in Chunks aufteilen für große Dokumente
+                                            text_chunks = []
+                                            chunk_size = 10000  # Zeichen pro Chunk
+
+                                            if len(pdf_text) > chunk_size:
+                                                st.info(f"📄 Großes Dokument erkannt ({len(pdf_text)} Zeichen). Verarbeite in Paketen...")
+
+                                                for i in range(0, len(pdf_text), chunk_size):
+                                                    text_chunks.append(pdf_text[i:i+chunk_size])
+                                            else:
+                                                text_chunks = [pdf_text]
+
+                                            total_cases = []
+                                            chunk_progress = st.progress(0)
+
+                                            for idx, chunk in enumerate(text_chunks):
+                                                with st.spinner(f"Analysiere Paket {idx+1}/{len(text_chunks)}..."):
+                                                    cases = analyze_cases_with_gpt(
+                                                        client,
+                                                        chunk,
+                                                        fachgebiet,
+                                                        model=gpt_model
+                                                    )
+                                                    if cases:
+                                                        total_cases.extend(cases)
+
+                                                chunk_progress.progress((idx + 1) / len(text_chunks))
+
+                                            if total_cases:
+                                                df = cases_list_to_dataframe(total_cases)
+                                                df = normalize_case_df(df, fachgebiet)
+                                                all_cases.append(df)
+                                                st.success(f"✓ **{len(total_cases)} Fälle** aus Cloud-Dokument extrahiert!")
+
+                                                with st.expander("Erkannte Fälle anzeigen"):
+                                                    st.dataframe(
+                                                        df[["kurzrubrum", "verfahrenstyp", "bereich_nr", "bedeutung"]],
+                                                        use_container_width=True,
+                                                        hide_index=True
+                                                    )
+                                            else:
+                                                st.warning("⚠️ Keine Fälle im Dokument erkannt")
 
                                 except Exception as e:
-                                    st.error(f"✗ {pdf_file.name}: {str(e)}")
-
-                            progress_bar.progress((i + 1) / len(pdf_files))
+                                    st.error(f"Fehler bei der Verarbeitung: {str(e)}")
+                            else:
+                                st.error(f"❌ {error}")
+                else:
+                    st.warning("⚠️ Link nicht erkannt. Bitte einen gültigen Google Drive oder Dropbox Link eingeben.")
 
     # Tab 2: Manueller Eintrag
     with tab_manual:
