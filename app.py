@@ -3,9 +3,10 @@ Fachanwalt-Falllistenverwaltung - Streamlit App
 ================================================
 Eine Anwendung zur Verwaltung von Fachanwaltsfällen mit FAO-Konformitätsprüfung.
 Ermöglicht Upload, Sortierung und Export von Falllisten gemäß § 5 FAO.
+Unterstützt PDF-Upload mit automatischer Fallauswertung via ChatGPT/OpenAI.
 
 Verwendung: streamlit run app.py
-Voraussetzungen: pip install streamlit pandas openpyxl
+Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 """
 
 import streamlit as st
@@ -13,7 +14,22 @@ import pandas as pd
 from io import BytesIO
 from datetime import datetime, date
 from typing import Dict, List, Tuple, Optional, Any
-from enum import Enum
+import json
+import re
+
+# PDF-Verarbeitung
+try:
+    from PyPDF2 import PdfReader
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+
+# OpenAI-Integration
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 
 # =============================================================================
 # KONFIGURATION - FAO-Mindestanforderungen (§ 5 FAO, Stand 01.06.2022)
@@ -25,7 +41,7 @@ FAO_CONFIG: Dict[str, Dict[str, Any]] = {
         "gesamt_min": 80,
         "gerichtlich_min": 20,
         "aussergerichtlich_min": 60,
-        "fg_max": 15,  # Max. Verfahren der freiwilligen Gerichtsbarkeit
+        "fg_max": 15,
         "bereiche": {
             1: "Materielles Erbrecht und Bezüge zum Familien- und Gesellschaftsrecht",
             2: "Testamentsvollstreckung und Nachlassverwaltung",
@@ -47,7 +63,7 @@ FAO_CONFIG: Dict[str, Dict[str, Any]] = {
     "Arbeitsrecht": {
         "paragraph": "§ 5 Abs. 1 lit. c, § 10 FAO",
         "gesamt_min": 100,
-        "gerichtlich_min": 50,  # mindestens die Hälfte
+        "gerichtlich_min": 50,
         "aussergerichtlich_min": 0,
         "bereiche": {
             1: "Individualarbeitsrecht",
@@ -89,7 +105,7 @@ FAO_CONFIG: Dict[str, Dict[str, Any]] = {
     "Familienrecht": {
         "paragraph": "§ 5 Abs. 1 lit. e, § 12 FAO",
         "gesamt_min": 120,
-        "gerichtlich_min": 60,  # gewillkürte/nötige Verbundverfahren zählen doppelt
+        "gerichtlich_min": 60,
         "aussergerichtlich_min": 0,
         "verbund_doppelt": True,
         "bereiche": {
@@ -132,7 +148,7 @@ FAO_CONFIG: Dict[str, Dict[str, Any]] = {
     "Handels- und Gesellschaftsrecht": {
         "paragraph": "§ 5 Abs. 1 lit. p, § 14i FAO",
         "gesamt_min": 80,
-        "gerichtlich_min": 40,  # Streit-/Schieds-/Mediationsverfahren + Gestaltung/Gründung
+        "gerichtlich_min": 40,
         "aussergerichtlich_min": 0,
         "bereiche": {
             1: "Streitverfahren (gerichtlich/Schiedsgerichtsbarkeit/Mediation)",
@@ -180,7 +196,6 @@ COLUMN_MAPPING: Dict[str, List[str]] = {
     "fachgebiet": ["Fachgebiet", "fachgebiet", "Rechtsgebiet", "Gebiet"],
 }
 
-# Standard-Spalten für die Template-Excel
 TEMPLATE_COLUMNS = [
     "Kanzlei-AZ", "Kurzrubrum", "Sachverhalt", "Zeitraum_von", "Zeitraum_bis",
     "Gerichts-AZ", "Verfahrenstyp", "Verfahrensart", "Bereich_Nr", "Bereich_Bezeichnung",
@@ -189,19 +204,178 @@ TEMPLATE_COLUMNS = [
 ]
 
 # =============================================================================
+# PDF-VERARBEITUNG
+# =============================================================================
+
+def extract_text_from_pdf(file) -> str:
+    """Extrahiert Text aus einer PDF-Datei."""
+    if not PDF_AVAILABLE:
+        raise ImportError("PyPDF2 ist nicht installiert. Bitte führen Sie 'pip install pypdf2' aus.")
+
+    reader = PdfReader(file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() + "\n"
+    return text
+
+
+# =============================================================================
+# OPENAI/CHATGPT-INTEGRATION
+# =============================================================================
+
+def get_openai_client(api_key: str) -> Optional[Any]:
+    """Erstellt einen OpenAI-Client mit dem angegebenen API-Key."""
+    if not OPENAI_AVAILABLE:
+        return None
+    return OpenAI(api_key=api_key)
+
+
+def analyze_cases_with_gpt(
+    client: Any,
+    text: str,
+    fachgebiet: str,
+    model: str = "gpt-4o-mini"
+) -> List[Dict[str, Any]]:
+    """
+    Analysiert Text mit ChatGPT und extrahiert Falldaten.
+
+    Args:
+        client: OpenAI-Client
+        text: Zu analysierender Text (aus PDF oder anderem Dokument)
+        fachgebiet: Gewähltes Fachgebiet für die Zuordnung
+        model: OpenAI-Modell (default: gpt-4o-mini)
+
+    Returns:
+        Liste von Fällen als Dictionaries
+    """
+    bereiche = FAO_CONFIG[fachgebiet].get("bereiche", {})
+    bereiche_text = "\n".join([f"  {nr}: {name}" for nr, name in bereiche.items()])
+
+    system_prompt = f"""Du bist ein juristischer Assistent, der Falldaten für einen Fachanwaltsantrag extrahiert.
+Das Fachgebiet ist: {fachgebiet}
+
+Die Bereiche für dieses Fachgebiet sind:
+{bereiche_text}
+
+Deine Aufgabe ist es, aus dem gegebenen Text alle rechtlichen Fälle zu extrahieren und in ein strukturiertes Format zu bringen.
+
+Für jeden Fall extrahiere folgende Informationen (falls vorhanden):
+- kanzlei_az: Kanzlei-Aktenzeichen
+- kurzrubrum: Anonymisiertes Rubrum (z.B. "A ./. B")
+- sachverhalt: Kurze Sachverhaltsbeschreibung
+- zeitraum_von: Beginn (Format: MM/YYYY)
+- zeitraum_bis: Ende (Format: MM/YYYY)
+- gericht_az: Gerichtsaktenzeichen (falls vorhanden)
+- verfahrenstyp: "gerichtlich", "rechtsfoermlich" oder "aussergerichtlich"
+- verfahrensart: z.B. "streitig", "fG", "Mahnverfahren", "Eilverfahren"
+- bereich_nr: Nummer des Bereichs (1-{len(bereiche)})
+- bereich_bezeichnung: Name des Bereichs
+- bedeutung: "gering", "mittel" oder "hoch"
+- taetigkeitsbeschreibung: Beschreibung der anwaltlichen Tätigkeit
+- stand: "anhaengig" oder "abgeschlossen"
+- abschluss_art: z.B. "Urteil", "Vergleich", "Beschluss"
+- abschluss_datum: Datum (Format: TT.MM.YYYY)
+
+Antworte NUR mit einem JSON-Array von Objekten. Keine zusätzliche Erklärung."""
+
+    user_prompt = f"""Analysiere den folgenden Text und extrahiere alle Fälle im JSON-Format:
+
+{text[:15000]}"""  # Begrenzen auf 15000 Zeichen
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=4000
+        )
+
+        content = response.choices[0].message.content.strip()
+
+        # JSON aus der Antwort extrahieren
+        # Manchmal ist die Antwort in Markdown-Code-Blöcken
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0]
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0]
+
+        cases = json.loads(content)
+
+        if isinstance(cases, dict):
+            cases = [cases]
+
+        return cases
+
+    except json.JSONDecodeError as e:
+        st.error(f"Fehler beim Parsen der GPT-Antwort: {e}")
+        return []
+    except Exception as e:
+        st.error(f"Fehler bei der GPT-Analyse: {e}")
+        return []
+
+
+def analyze_single_case_with_gpt(
+    client: Any,
+    text: str,
+    fachgebiet: str,
+    model: str = "gpt-4o-mini"
+) -> Dict[str, Any]:
+    """
+    Analysiert einen einzelnen Fall-Text mit ChatGPT.
+    Nützlich für manuelle Eingabe oder einzelne Dokumente.
+    """
+    bereiche = FAO_CONFIG[fachgebiet].get("bereiche", {})
+    bereiche_text = "\n".join([f"  {nr}: {name}" for nr, name in bereiche.items()])
+
+    system_prompt = f"""Du bist ein juristischer Assistent für Fachanwaltsanträge.
+Fachgebiet: {fachgebiet}
+
+Bereiche:
+{bereiche_text}
+
+Analysiere den Fall und gib ein JSON-Objekt mit diesen Feldern zurück:
+- kanzlei_az, kurzrubrum, sachverhalt, zeitraum_von, zeitraum_bis
+- gericht_az, verfahrenstyp, verfahrensart
+- bereich_nr (Integer), bereich_bezeichnung
+- bedeutung, taetigkeitsbeschreibung, stand
+- abschluss_art, abschluss_datum
+
+Antworte NUR mit JSON, keine Erklärung."""
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            temperature=0.1,
+            max_tokens=1000
+        )
+
+        content = response.choices[0].message.content.strip()
+
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0]
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0]
+
+        return json.loads(content)
+
+    except Exception as e:
+        st.error(f"Fehler bei der Einzelfall-Analyse: {e}")
+        return {}
+
+
+# =============================================================================
 # HILFSFUNKTIONEN
 # =============================================================================
 
 def map_column_name(col_name: str) -> Optional[str]:
-    """
-    Mappt einen Spaltennamen auf den internen Feldnamen.
-
-    Args:
-        col_name: Ursprünglicher Spaltenname aus der Datei
-
-    Returns:
-        Interner Feldname oder None wenn keine Zuordnung gefunden
-    """
+    """Mappt einen Spaltennamen auf den internen Feldnamen."""
     col_normalized = col_name.strip()
     for internal_name, variants in COLUMN_MAPPING.items():
         if col_normalized in variants:
@@ -210,15 +384,7 @@ def map_column_name(col_name: str) -> Optional[str]:
 
 
 def load_cases_from_file(file) -> pd.DataFrame:
-    """
-    Liest Fälle aus einer CSV- oder Excel-Datei.
-
-    Args:
-        file: Hochgeladene Datei (Streamlit UploadedFile)
-
-    Returns:
-        DataFrame mit den eingelesenen Fällen
-    """
+    """Liest Fälle aus einer CSV- oder Excel-Datei."""
     filename = file.name.lower()
 
     if filename.endswith('.csv'):
@@ -231,18 +397,15 @@ def load_cases_from_file(file) -> pd.DataFrame:
     return df
 
 
+def cases_list_to_dataframe(cases: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Konvertiert eine Liste von Fall-Dictionaries in einen DataFrame."""
+    if not cases:
+        return pd.DataFrame()
+    return pd.DataFrame(cases)
+
+
 def normalize_case_df(df: pd.DataFrame, fachgebiet: str) -> pd.DataFrame:
-    """
-    Normalisiert einen DataFrame auf das interne Datenmodell.
-    Mappt Spaltennamen und ergänzt fehlende Standardfelder.
-
-    Args:
-        df: Roher DataFrame aus der Datei
-        fachgebiet: Gewähltes Fachgebiet für Default-Zuordnung
-
-    Returns:
-        Normalisierter DataFrame mit einheitlichen Spaltennamen
-    """
+    """Normalisiert einen DataFrame auf das interne Datenmodell."""
     # Spalten-Mapping anwenden
     new_columns = {}
     for col in df.columns:
@@ -250,12 +413,11 @@ def normalize_case_df(df: pd.DataFrame, fachgebiet: str) -> pd.DataFrame:
         if mapped:
             new_columns[col] = mapped
         else:
-            # Behalte Original-Spalte mit lowercase
             new_columns[col] = col.lower().replace("-", "_").replace(" ", "_")
 
     df = df.rename(columns=new_columns)
 
-    # Standardfelder ergänzen falls nicht vorhanden
+    # Standardfelder ergänzen
     default_values = {
         "fachgebiet": fachgebiet,
         "kanzlei_az": "",
@@ -280,7 +442,6 @@ def normalize_case_df(df: pd.DataFrame, fachgebiet: str) -> pd.DataFrame:
         if field not in df.columns:
             df[field] = default
 
-    # Wenn kein Fachgebiet in der Datei, das gewählte verwenden
     df["fachgebiet"] = df["fachgebiet"].fillna(fachgebiet)
     df.loc[df["fachgebiet"] == "", "fachgebiet"] = fachgebiet
 
@@ -294,10 +455,8 @@ def normalize_case_df(df: pd.DataFrame, fachgebiet: str) -> pd.DataFrame:
         "aussergerichtlich": "aussergerichtlich",
     })
 
-    # Verfahrensart normalisieren
     df["verfahrensart"] = df["verfahrensart"].astype(str).str.lower().str.strip()
 
-    # Bedeutung normalisieren
     df["bedeutung"] = df["bedeutung"].astype(str).str.lower().str.strip()
     df["bedeutung"] = df["bedeutung"].replace({
         "niedrig": "gering",
@@ -305,28 +464,18 @@ def normalize_case_df(df: pd.DataFrame, fachgebiet: str) -> pd.DataFrame:
         "mittel": "mittel",
     })
 
-    # Bereich_Nr als Integer
     df["bereich_nr"] = pd.to_numeric(df["bereich_nr"], errors='coerce').fillna(0).astype(int)
 
     return df
 
 
 def split_into_falllisten(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Trennt Fälle in gerichtliche/rechtsförmliche und außergerichtliche Verfahren.
-
-    Args:
-        df: Normalisierter DataFrame mit allen Fällen
-
-    Returns:
-        Tuple aus (FL1: gerichtlich/rechtsförmlich, FL2: außergerichtlich)
-    """
+    """Trennt Fälle in gerichtliche/rechtsförmliche und außergerichtliche Verfahren."""
     mask_gerichtlich = df["verfahrenstyp"].isin(["gerichtlich", "rechtsfoermlich"])
 
     fl1 = df[mask_gerichtlich].copy()
     fl2 = df[~mask_gerichtlich].copy()
 
-    # Fortlaufende Nummern vergeben
     fl1.insert(0, "FL1_Nr", range(1, len(fl1) + 1))
     fl2.insert(0, "FL2_Nr", range(1, len(fl2) + 1))
 
@@ -339,38 +488,22 @@ def count_by_bereich(df: pd.DataFrame) -> Dict[int, int]:
 
 
 def compute_summary(df: pd.DataFrame, fachgebiet: str) -> Dict[str, Any]:
-    """
-    Berechnet Ist-Zahlen und vergleicht mit FAO-Mindestanforderungen.
-
-    Args:
-        df: Normalisierter DataFrame (nur für das gewählte Fachgebiet)
-        fachgebiet: Name des Fachgebiets
-
-    Returns:
-        Dictionary mit Summary-Daten und Warnungen
-    """
+    """Berechnet Ist-Zahlen und vergleicht mit FAO-Mindestanforderungen."""
     config = FAO_CONFIG.get(fachgebiet, {})
 
-    # Grundzählung
     gesamt = len(df)
     gerichtlich = len(df[df["verfahrenstyp"].isin(["gerichtlich", "rechtsfoermlich"])])
     aussergerichtlich = len(df[df["verfahrenstyp"] == "aussergerichtlich"])
-
-    # fG-Verfahren zählen (für Erbrecht relevant)
     fg_verfahren = len(df[df["verfahrensart"].str.contains("fg|freiwillige", case=False, na=False)])
-
-    # Bereichsverteilung
     bereich_counts = count_by_bereich(df)
 
-    # Verbundverfahren (für Familienrecht - zählen doppelt)
     verbund_count = 0
     if fachgebiet == "Familienrecht" and config.get("verbund_doppelt"):
         verbund_count = len(df[df["verfahrensart"].str.contains("verbund", case=False, na=False)])
-        gerichtlich_effektiv = gerichtlich + verbund_count  # Verbundverfahren zählen doppelt
+        gerichtlich_effektiv = gerichtlich + verbund_count
     else:
         gerichtlich_effektiv = gerichtlich
 
-    # FAO-Prüfung
     checks = []
     warnungen = []
 
@@ -402,7 +535,7 @@ def compute_summary(df: pd.DataFrame, fachgebiet: str) -> Dict[str, Any]:
             checks.append((label, ist_wert, gerichtlich_min, "nicht_erfuellt"))
             warnungen.append(f"Gerichtliche Verfahren fehlen: {ist_wert}/{gerichtlich_min} (fehlen: {gerichtlich_min - ist_wert})")
 
-    # Außergerichtliche Verfahren (Erbrecht-spezifisch)
+    # Außergerichtliche Verfahren
     aussergerichtlich_min = config.get("aussergerichtlich_min", 0)
     if aussergerichtlich_min > 0:
         if aussergerichtlich >= aussergerichtlich_min:
@@ -429,7 +562,6 @@ def compute_summary(df: pd.DataFrame, fachgebiet: str) -> Dict[str, Any]:
     if "min_bereiche" in bereiche_anf:
         min_bereiche = bereiche_anf["min_bereiche"]
         min_faelle = bereiche_anf.get("min_faelle_pro_bereich", 5)
-
         bereiche_erfuellt = sum(1 for count in bereich_counts.values() if count >= min_faelle)
 
         if bereiche_erfuellt >= min_bereiche:
@@ -438,13 +570,12 @@ def compute_summary(df: pd.DataFrame, fachgebiet: str) -> Dict[str, Any]:
             checks.append((f"Bereiche mit ≥{min_faelle} Fällen", bereiche_erfuellt, min_bereiche, "nicht_erfuellt"))
             warnungen.append(f"Zu wenige Bereiche mit ausreichend Fällen: {bereiche_erfuellt}/{min_bereiche}")
 
-            # Detaillierte Bereichs-Warnung
             for bereich_nr, bereich_name in config.get("bereiche", {}).items():
                 count = bereich_counts.get(bereich_nr, 0)
                 if count < min_faelle:
                     warnungen.append(f"Bereich {bereich_nr} ({bereich_name}): nur {count}/{min_faelle} Fälle")
 
-    # Spezial-Anforderungen (Arbeitsrecht, HGR)
+    # Spezial-Anforderungen
     spezial = bereiche_anf.get("spezial_anforderung")
 
     if spezial == "kollektiv":
@@ -479,18 +610,15 @@ def compute_summary(df: pd.DataFrame, fachgebiet: str) -> Dict[str, Any]:
             checks.append(("Gestaltung/Gründung", gestaltung_count, gestaltung_min, "nicht_erfuellt"))
             warnungen.append(f"Gestaltung/Gründung: {gestaltung_count}/{gestaltung_min}")
 
-    # Zusätzliche Warnungen
     # Zeitraum-Prüfung (3 Jahre)
     heute = date.today()
     drei_jahre_zuvor = date(heute.year - 3, heute.month, heute.day)
 
-    # Prüfe auf Fälle außerhalb des 3-Jahres-Zeitraums
     for idx, row in df.iterrows():
         try:
             abschluss = row.get("abschluss_datum")
             if pd.notna(abschluss) and abschluss != "":
                 if isinstance(abschluss, str):
-                    # Versuche verschiedene Datumsformate
                     for fmt in ["%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"]:
                         try:
                             parsed = datetime.strptime(abschluss, fmt).date()
@@ -500,7 +628,8 @@ def compute_summary(df: pd.DataFrame, fachgebiet: str) -> Dict[str, Any]:
                         except ValueError:
                             continue
                 elif isinstance(abschluss, (datetime, date)):
-                    if abschluss.date() if isinstance(abschluss, datetime) else abschluss < drei_jahre_zuvor:
+                    check_date = abschluss.date() if isinstance(abschluss, datetime) else abschluss
+                    if check_date < drei_jahre_zuvor:
                         warnungen.append(f"Fall {row.get('kanzlei_az', idx)}: Abschluss außerhalb des 3-Jahres-Zeitraums")
         except Exception:
             pass
@@ -582,14 +711,10 @@ def create_summary_df(summary: Dict[str, Any]) -> pd.DataFrame:
     """Erstellt DataFrame für Summary-Tabellenblatt."""
     rows = []
 
-    # Kopfzeile mit Fachgebiet
     rows.append({"Kategorie": "FACHGEBIET", "Wert": summary["fachgebiet"], "Anforderung": summary["paragraph"]})
     rows.append({"Kategorie": "", "Wert": "", "Anforderung": ""})
-
-    # Kennzahlen-Überschrift
     rows.append({"Kategorie": "=== KENNZAHLEN ===", "Wert": "", "Anforderung": ""})
 
-    # FAO-Checks
     for check in summary["checks"]:
         kriterium, ist, soll, status = check
         status_symbol = {"erfuellt": "✓", "knapp": "⚠️", "nicht_erfuellt": "✗"}.get(status, "?")
@@ -600,8 +725,6 @@ def create_summary_df(summary: Dict[str, Any]) -> pd.DataFrame:
         })
 
     rows.append({"Kategorie": "", "Wert": "", "Anforderung": ""})
-
-    # Bereichsverteilung
     rows.append({"Kategorie": "=== BEREICHSVERTEILUNG ===", "Wert": "", "Anforderung": ""})
 
     for bereich_nr, bereich_name in summary.get("bereiche_config", {}).items():
@@ -614,7 +737,6 @@ def create_summary_df(summary: Dict[str, Any]) -> pd.DataFrame:
 
     rows.append({"Kategorie": "", "Wert": "", "Anforderung": ""})
 
-    # Warnungen
     if summary["warnungen"]:
         rows.append({"Kategorie": "=== WARNUNGEN ===", "Wert": "", "Anforderung": ""})
         for warnung in summary["warnungen"]:
@@ -627,30 +749,16 @@ def create_summary_df(summary: Dict[str, Any]) -> pd.DataFrame:
 
 def create_excel(fl1_df: pd.DataFrame, fl2_df: pd.DataFrame,
                  summary: Dict[str, Any], fachgebiet: str) -> bytes:
-    """
-    Erstellt Excel-Arbeitsmappe mit Falllisten und Summary.
-
-    Args:
-        fl1_df: DataFrame für Fallliste 1 (gerichtlich/rechtsförmlich)
-        fl2_df: DataFrame für Fallliste 2 (außergerichtlich)
-        summary: Summary-Dictionary aus compute_summary()
-        fachgebiet: Name des Fachgebiets
-
-    Returns:
-        Excel-Datei als Bytes
-    """
+    """Erstellt Excel-Arbeitsmappe mit Falllisten und Summary."""
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # Fallliste 1
         fl1_export = prepare_fl1_for_export(fl1_df) if len(fl1_df) > 0 else pd.DataFrame()
         fl1_export.to_excel(writer, sheet_name="Fallliste_1", index=False)
 
-        # Fallliste 2
         fl2_export = prepare_fl2_for_export(fl2_df) if len(fl2_df) > 0 else pd.DataFrame()
         fl2_export.to_excel(writer, sheet_name="Fallliste_2", index=False)
 
-        # Summary
         summary_df = create_summary_df(summary)
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
 
@@ -660,11 +768,8 @@ def create_excel(fl1_df: pd.DataFrame, fl2_df: pd.DataFrame,
 def create_template_excel() -> bytes:
     """Erstellt eine leere Excel-Vorlage mit den erwarteten Spalten."""
     output = BytesIO()
-
-    # Leeres DataFrame mit Spalten
     df = pd.DataFrame(columns=TEMPLATE_COLUMNS)
 
-    # Eine Beispielzeile hinzufügen
     beispiel = {
         "Kanzlei-AZ": "2024/001",
         "Kurzrubrum": "A ./. B (Nachlass)",
@@ -689,7 +794,6 @@ def create_template_excel() -> bytes:
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name="Faelle", index=False)
 
-        # Zusätzliches Blatt mit Erklärungen
         erklaerungen = pd.DataFrame({
             "Spalte": TEMPLATE_COLUMNS,
             "Beschreibung": [
@@ -717,22 +821,9 @@ def create_template_excel() -> bytes:
     return output.getvalue()
 
 
-def get_status_color(status: str) -> str:
-    """Gibt Farbe für Status zurück."""
-    return {
-        "erfuellt": "green",
-        "knapp": "orange",
-        "nicht_erfuellt": "red"
-    }.get(status, "gray")
-
-
 def get_status_symbol(status: str) -> str:
     """Gibt Symbol für Status zurück."""
-    return {
-        "erfuellt": "✓",
-        "knapp": "⚠️",
-        "nicht_erfuellt": "✗"
-    }.get(status, "?")
+    return {"erfuellt": "✓", "knapp": "⚠️", "nicht_erfuellt": "✗"}.get(status, "?")
 
 
 # =============================================================================
@@ -751,6 +842,12 @@ def main():
     st.title("⚖️ Fachanwalt-Falllistenverwaltung")
     st.markdown("**FAO-konforme Falllisten für Fachanwaltsanträge**")
 
+    # Session State initialisieren
+    if "cases_df" not in st.session_state:
+        st.session_state.cases_df = pd.DataFrame()
+    if "openai_api_key" not in st.session_state:
+        st.session_state.openai_api_key = ""
+
     # Sidebar
     with st.sidebar:
         st.header("📋 Einstellungen")
@@ -762,6 +859,28 @@ def main():
             help="Wählen Sie das Fachgebiet für die Falllistenerstellung"
         )
 
+        # OpenAI API-Key Eingabe
+        st.markdown("---")
+        st.subheader("🤖 ChatGPT-Integration")
+
+        api_key = st.text_input(
+            "OpenAI API-Key",
+            type="password",
+            value=st.session_state.openai_api_key,
+            help="Für automatische PDF-Analyse benötigt. Holen Sie sich einen Key unter platform.openai.com"
+        )
+
+        if api_key:
+            st.session_state.openai_api_key = api_key
+            st.success("✓ API-Key gespeichert")
+
+        # Modell-Auswahl
+        gpt_model = st.selectbox(
+            "GPT-Modell",
+            options=["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
+            help="gpt-4o-mini ist schnell und günstig, gpt-4o für beste Qualität"
+        )
+
         # Hinweis zu Mindestanforderungen
         st.markdown("---")
         st.subheader("📌 Anforderungen")
@@ -769,7 +888,6 @@ def main():
         st.markdown(f"**{config['paragraph']}**")
         st.info(config["hinweis"])
 
-        # Bereiche anzeigen
         if "bereiche" in config:
             st.markdown("**Bereiche:**")
             for nr, name in config["bereiche"].items():
@@ -785,92 +903,244 @@ def main():
             data=template_bytes,
             file_name="fallliste_vorlage.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help="Laden Sie eine leere Excel-Vorlage mit den erwarteten Spalten herunter"
         )
 
-    # Hauptbereich
+    # Hauptbereich - Tabs für verschiedene Upload-Methoden
     st.header("📤 Dateien hochladen")
 
-    uploaded_files = st.file_uploader(
-        "Fall-Dateien hochladen (CSV oder Excel)",
-        type=["csv", "xlsx", "xls"],
-        accept_multiple_files=True,
-        help="Laden Sie eine oder mehrere Dateien mit Ihren Fällen hoch"
-    )
+    upload_tab1, upload_tab2, upload_tab3 = st.tabs([
+        "📄 Excel/CSV Upload",
+        "📕 PDF Upload (mit KI-Analyse)",
+        "✏️ Manueller Fall-Eintrag"
+    ])
 
-    if not uploaded_files:
-        st.info(
-            "👈 Bitte laden Sie Ihre Fall-Dateien hoch oder laden Sie die Vorlage herunter, "
-            "um das erwartete Format zu sehen."
+    all_cases = []
+
+    # Tab 1: Excel/CSV Upload
+    with upload_tab1:
+        st.markdown("Laden Sie strukturierte Falldaten im Excel- oder CSV-Format hoch.")
+
+        uploaded_files = st.file_uploader(
+            "Excel/CSV-Dateien auswählen",
+            type=["csv", "xlsx", "xls"],
+            accept_multiple_files=True,
+            key="excel_upload"
         )
 
-        # Anleitung anzeigen
-        with st.expander("📖 Anleitung zur Verwendung"):
+        if uploaded_files:
+            with st.spinner("Dateien werden verarbeitet..."):
+                for file in uploaded_files:
+                    try:
+                        df = load_cases_from_file(file)
+                        df = normalize_case_df(df, fachgebiet)
+                        all_cases.append(df)
+                        st.success(f"✓ {file.name}: {len(df)} Fälle geladen")
+                    except Exception as e:
+                        st.error(f"✗ {file.name}: Fehler - {str(e)}")
+
+    # Tab 2: PDF Upload mit KI-Analyse
+    with upload_tab2:
+        if not PDF_AVAILABLE:
+            st.error("⚠️ PyPDF2 ist nicht installiert. Bitte führen Sie aus: `pip install pypdf2`")
+        elif not OPENAI_AVAILABLE:
+            st.error("⚠️ OpenAI ist nicht installiert. Bitte führen Sie aus: `pip install openai`")
+        elif not st.session_state.openai_api_key:
+            st.warning("⚠️ Bitte geben Sie Ihren OpenAI API-Key in der Sidebar ein.")
+        else:
             st.markdown("""
-            ### So verwenden Sie diese App:
+            Laden Sie PDF-Dokumente hoch (z.B. Mandatsübersichten, Fallberichte).
+            ChatGPT analysiert den Text und extrahiert automatisch die Falldaten.
+            """)
 
-            1. **Fachgebiet wählen**: Wählen Sie in der Seitenleiste das gewünschte Fachgebiet aus.
+            pdf_files = st.file_uploader(
+                "PDF-Dateien auswählen",
+                type=["pdf"],
+                accept_multiple_files=True,
+                key="pdf_upload"
+            )
 
-            2. **Vorlage herunterladen**: Laden Sie die Excel-Vorlage herunter, um das erwartete Dateiformat zu sehen.
+            if pdf_files:
+                client = get_openai_client(st.session_state.openai_api_key)
 
-            3. **Fälle eintragen**: Füllen Sie die Vorlage mit Ihren Fällen aus. Jede Zeile entspricht einem Fall.
+                if client:
+                    for pdf_file in pdf_files:
+                        with st.spinner(f"Analysiere {pdf_file.name} mit ChatGPT..."):
+                            try:
+                                # Text aus PDF extrahieren
+                                pdf_text = extract_text_from_pdf(pdf_file)
 
-            4. **Dateien hochladen**: Laden Sie Ihre ausgefüllte(n) Datei(en) hier hoch.
+                                if len(pdf_text.strip()) < 50:
+                                    st.warning(f"⚠️ {pdf_file.name}: Wenig Text extrahiert. Möglicherweise ein gescanntes PDF.")
+                                    continue
 
-            5. **Auswertung prüfen**: Die App zeigt Ihnen automatisch:
-               - Die Aufteilung in gerichtliche und außergerichtliche Verfahren
-               - Den FAO-Konformitätscheck mit allen Mindestanforderungen
-               - Warnungen bei fehlenden Fällen oder Problemen
+                                # Mit ChatGPT analysieren
+                                cases = analyze_cases_with_gpt(
+                                    client,
+                                    pdf_text,
+                                    fachgebiet,
+                                    model=gpt_model
+                                )
 
-            6. **Export**: Laden Sie die fertige Fallliste als Excel-Datei herunter.
+                                if cases:
+                                    df = cases_list_to_dataframe(cases)
+                                    df = normalize_case_df(df, fachgebiet)
+                                    all_cases.append(df)
+                                    st.success(f"✓ {pdf_file.name}: {len(cases)} Fälle erkannt")
 
-            ### Wichtige Hinweise:
+                                    # Vorschau der erkannten Fälle
+                                    with st.expander(f"Erkannte Fälle aus {pdf_file.name}"):
+                                        st.dataframe(df[["kurzrubrum", "verfahrenstyp", "bereich_nr", "bedeutung"]])
+                                else:
+                                    st.warning(f"⚠️ {pdf_file.name}: Keine Fälle erkannt")
 
-            - **Verfahrenstyp**: Verwenden Sie `gerichtlich`, `rechtsfoermlich` oder `aussergerichtlich`
-            - **Bereich_Nr**: Tragen Sie die Nummer des Fachbereichs gem. FAO ein (siehe Seitenleiste)
-            - **Zeitraum**: Fälle sollten innerhalb der letzten 3 Jahre abgeschlossen sein
+                            except Exception as e:
+                                st.error(f"✗ {pdf_file.name}: {str(e)}")
+
+    # Tab 3: Manueller Eintrag
+    with upload_tab3:
+        st.markdown("Geben Sie einen Fall manuell ein oder beschreiben Sie ihn für die KI-Analyse.")
+
+        manual_method = st.radio(
+            "Eingabemethode",
+            ["Strukturierte Eingabe", "Freitext (KI-Analyse)"],
+            horizontal=True
+        )
+
+        if manual_method == "Strukturierte Eingabe":
+            col1, col2 = st.columns(2)
+
+            with col1:
+                m_kanzlei_az = st.text_input("Kanzlei-AZ", placeholder="2024/001")
+                m_kurzrubrum = st.text_input("Kurzrubrum", placeholder="A ./. B")
+                m_sachverhalt = st.text_area("Sachverhalt", placeholder="Kurze Beschreibung...")
+                m_zeitraum_von = st.text_input("Zeitraum von", placeholder="01/2024")
+                m_zeitraum_bis = st.text_input("Zeitraum bis", placeholder="06/2024")
+                m_gericht_az = st.text_input("Gerichts-AZ", placeholder="12 O 123/24")
+
+            with col2:
+                m_verfahrenstyp = st.selectbox("Verfahrenstyp", ["gerichtlich", "rechtsfoermlich", "aussergerichtlich"])
+                m_verfahrensart = st.text_input("Verfahrensart", placeholder="streitig / fG / Mahnverfahren")
+                m_bereich_nr = st.selectbox("Bereich-Nr", list(config["bereiche"].keys()))
+                m_bereich_bez = config["bereiche"].get(m_bereich_nr, "")
+                st.text_input("Bereich-Bezeichnung", value=m_bereich_bez, disabled=True)
+                m_bedeutung = st.selectbox("Bedeutung", ["gering", "mittel", "hoch"])
+                m_stand = st.selectbox("Stand", ["abgeschlossen", "anhaengig"])
+
+            m_taetigkeit = st.text_area("Tätigkeitsbeschreibung", placeholder="Beratung, Verhandlung, ...")
+
+            col3, col4 = st.columns(2)
+            with col3:
+                m_abschluss_art = st.text_input("Abschluss-Art", placeholder="Vergleich / Urteil / ...")
+            with col4:
+                m_abschluss_datum = st.text_input("Abschluss-Datum", placeholder="15.06.2024")
+
+            if st.button("➕ Fall hinzufügen", type="primary"):
+                new_case = {
+                    "kanzlei_az": m_kanzlei_az,
+                    "kurzrubrum": m_kurzrubrum,
+                    "sachverhalt": m_sachverhalt,
+                    "zeitraum_von": m_zeitraum_von,
+                    "zeitraum_bis": m_zeitraum_bis,
+                    "gericht_az": m_gericht_az,
+                    "verfahrenstyp": m_verfahrenstyp,
+                    "verfahrensart": m_verfahrensart,
+                    "bereich_nr": m_bereich_nr,
+                    "bereich_bezeichnung": m_bereich_bez,
+                    "bedeutung": m_bedeutung,
+                    "taetigkeitsbeschreibung": m_taetigkeit,
+                    "stand": m_stand,
+                    "abschluss_art": m_abschluss_art,
+                    "abschluss_datum": m_abschluss_datum,
+                    "fachgebiet": fachgebiet,
+                    "verbundener_fall": ""
+                }
+
+                new_df = pd.DataFrame([new_case])
+                all_cases.append(new_df)
+                st.success("✓ Fall hinzugefügt!")
+
+        else:  # Freitext mit KI
+            if not st.session_state.openai_api_key:
+                st.warning("⚠️ Für KI-Analyse bitte OpenAI API-Key in der Sidebar eingeben.")
+            else:
+                freitext = st.text_area(
+                    "Fall-Beschreibung",
+                    placeholder="Beschreiben Sie den Fall frei, z.B.:\n\nMandant A beauftragte mich im Januar 2024 mit der Durchsetzung seiner Erbansprüche gegen die Erbengemeinschaft...",
+                    height=200
+                )
+
+                if st.button("🤖 Mit ChatGPT analysieren", type="primary"):
+                    if freitext:
+                        client = get_openai_client(st.session_state.openai_api_key)
+                        if client:
+                            with st.spinner("ChatGPT analysiert..."):
+                                case_data = analyze_single_case_with_gpt(
+                                    client, freitext, fachgebiet, gpt_model
+                                )
+
+                                if case_data:
+                                    new_df = pd.DataFrame([case_data])
+                                    new_df = normalize_case_df(new_df, fachgebiet)
+                                    all_cases.append(new_df)
+                                    st.success("✓ Fall erkannt und hinzugefügt!")
+                                    st.json(case_data)
+                    else:
+                        st.warning("Bitte geben Sie eine Fallbeschreibung ein.")
+
+    # Fälle zusammenführen und anzeigen
+    if not all_cases and st.session_state.cases_df.empty:
+        st.info("👈 Laden Sie Dateien hoch oder geben Sie Fälle manuell ein.")
+
+        with st.expander("📖 Anleitung"):
+            st.markdown("""
+            ### Verwendung:
+
+            1. **Fachgebiet wählen** (Sidebar)
+            2. **OpenAI API-Key eingeben** (für PDF-Analyse)
+            3. **Dateien hochladen:**
+               - **Excel/CSV**: Strukturierte Falldaten
+               - **PDF**: Automatische Analyse mit ChatGPT
+               - **Manuell**: Einzelne Fälle eingeben
+            4. **Ergebnis prüfen** und **Excel exportieren**
+
+            ### PDF-Analyse:
+            Die KI liest Ihre PDFs und extrahiert automatisch:
+            - Aktenzeichen, Parteien, Zeiträume
+            - Verfahrenstyp und -art
+            - Fachbereich und Bedeutung
             """)
         return
 
-    # Dateien verarbeiten
-    all_cases = []
+    # Alle neuen Fälle mit bestehenden kombinieren
+    if all_cases:
+        new_combined = pd.concat(all_cases, ignore_index=True)
+        if not st.session_state.cases_df.empty:
+            st.session_state.cases_df = pd.concat(
+                [st.session_state.cases_df, new_combined],
+                ignore_index=True
+            )
+        else:
+            st.session_state.cases_df = new_combined
 
-    with st.spinner("Dateien werden verarbeitet..."):
-        for file in uploaded_files:
-            try:
-                df = load_cases_from_file(file)
-                df = normalize_case_df(df, fachgebiet)
-                all_cases.append(df)
-                st.success(f"✓ {file.name}: {len(df)} Fälle geladen")
-            except Exception as e:
-                st.error(f"✗ {file.name}: Fehler beim Laden - {str(e)}")
-
-    if not all_cases:
-        st.warning("Keine Fälle konnten geladen werden. Bitte prüfen Sie das Dateiformat.")
+    if st.session_state.cases_df.empty:
         return
 
-    # Alle Fälle zusammenführen
-    combined_df = pd.concat(all_cases, ignore_index=True)
-
     # Nach Fachgebiet filtern
-    if "fachgebiet" in combined_df.columns:
-        filtered_df = combined_df[combined_df["fachgebiet"] == fachgebiet].copy()
-        if len(filtered_df) == 0:
-            st.warning(f"Keine Fälle für das Fachgebiet '{fachgebiet}' gefunden. "
-                      f"Es werden alle {len(combined_df)} Fälle verwendet.")
-            filtered_df = combined_df.copy()
-    else:
-        filtered_df = combined_df.copy()
+    filtered_df = st.session_state.cases_df[
+        st.session_state.cases_df["fachgebiet"] == fachgebiet
+    ].copy()
+
+    if len(filtered_df) == 0:
+        filtered_df = st.session_state.cases_df.copy()
+        st.info(f"Keine Fälle für '{fachgebiet}' gefunden. Zeige alle {len(filtered_df)} Fälle.")
 
     st.markdown("---")
 
     # Falllisten aufteilen
     fl1, fl2 = split_into_falllisten(filtered_df)
-
-    # Summary berechnen
     summary = compute_summary(filtered_df, fachgebiet)
 
-    # Dashboard-Bereich
+    # Dashboard
     st.header("📊 Dashboard")
 
     col1, col2, col3, col4 = st.columns(4)
@@ -907,9 +1177,8 @@ def main():
 
     st.markdown("---")
 
-    # FAO-Konformitätscheck
+    # FAO-Check
     st.header("✅ FAO-Konformitätscheck")
-
     check_cols = st.columns(2)
 
     for i, check in enumerate(summary["checks"]):
@@ -918,8 +1187,6 @@ def main():
 
         with col:
             symbol = get_status_symbol(status)
-            color = get_status_color(status)
-
             if status == "erfuellt":
                 st.success(f"{symbol} **{kriterium}**: {ist}/{soll}")
             elif status == "knapp":
@@ -949,7 +1216,6 @@ def main():
     if summary["warnungen"]:
         st.markdown("---")
         st.header("⚠️ Warnungen")
-
         for warnung in summary["warnungen"]:
             st.warning(warnung)
 
@@ -958,41 +1224,39 @@ def main():
     st.header("📋 Falllisten-Vorschau")
 
     tab1, tab2 = st.tabs([
-        f"Fallliste 1 - Gerichtlich/Rechtsförmlich ({len(fl1)} Fälle)",
+        f"Fallliste 1 - Gerichtlich ({len(fl1)} Fälle)",
         f"Fallliste 2 - Außergerichtlich ({len(fl2)} Fälle)"
     ])
 
     with tab1:
         if len(fl1) > 0:
             display_cols = ["FL1_Nr", "kurzrubrum", "kanzlei_az", "gericht_az",
-                          "bereich_nr", "verfahrenstyp", "verfahrensart", "bedeutung", "stand"]
+                          "bereich_nr", "verfahrenstyp", "bedeutung", "stand"]
             display_cols = [c for c in display_cols if c in fl1.columns]
             st.dataframe(fl1[display_cols], use_container_width=True, hide_index=True)
         else:
-            st.info("Keine gerichtlichen/rechtsförmlichen Verfahren vorhanden.")
+            st.info("Keine gerichtlichen Verfahren vorhanden.")
 
     with tab2:
         if len(fl2) > 0:
-            display_cols = ["FL2_Nr", "kurzrubrum", "kanzlei_az",
-                          "bereich_nr", "bedeutung"]
+            display_cols = ["FL2_Nr", "kurzrubrum", "kanzlei_az", "bereich_nr", "bedeutung"]
             display_cols = [c for c in display_cols if c in fl2.columns]
             st.dataframe(fl2[display_cols], use_container_width=True, hide_index=True)
         else:
             st.info("Keine außergerichtlichen Verfahren vorhanden.")
 
-    # Excel-Download
+    # Export
     st.markdown("---")
     st.header("📥 Export")
 
     excel_bytes = create_excel(fl1, fl2, summary, fachgebiet)
-
     filename = f"fallliste_{fachgebiet.lower().replace(' ', '_').replace('-', '_')}_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
-    col1, col2 = st.columns([1, 3])
+    col1, col2, col3 = st.columns([1, 1, 2])
 
     with col1:
         st.download_button(
-            label="📥 Excel-Datei herunterladen",
+            label="📥 Excel herunterladen",
             data=excel_bytes,
             file_name=filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1000,7 +1264,12 @@ def main():
         )
 
     with col2:
-        st.info(f"Die Excel-Datei enthält 3 Tabellenblätter: Fallliste_1, Fallliste_2 und Summary.")
+        if st.button("🗑️ Alle Fälle löschen"):
+            st.session_state.cases_df = pd.DataFrame()
+            st.rerun()
+
+    with col3:
+        st.info("Die Excel enthält 3 Blätter: Fallliste_1, Fallliste_2, Summary")
 
 
 if __name__ == "__main__":
