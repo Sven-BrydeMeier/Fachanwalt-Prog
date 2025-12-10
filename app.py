@@ -12,7 +12,7 @@ Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 # =============================================================================
 # VERSION
 # =============================================================================
-APP_VERSION = "25.12.10-18:30"
+APP_VERSION = "25.12.10-19:15"
 
 import streamlit as st
 import pandas as pd
@@ -1307,6 +1307,8 @@ def main():
         st.session_state.unprocessed_files = []  # Dateien die nicht verarbeitet werden konnten
     if "unrecognized_texts" not in st.session_state:
         st.session_state.unrecognized_texts = []  # Texte ohne erkannte Fälle
+    if "last_processed_file" not in st.session_state:
+        st.session_state.last_processed_file = None  # Zuletzt verarbeitete Datei
 
     # Sidebar
     with st.sidebar:
@@ -1341,6 +1343,13 @@ def main():
         st.metric("Erfasste Fälle", current_count)
         if current_count > 0:
             st.caption("Die Fallliste wird bei jedem Upload erweitert.")
+
+        # Zuletzt verarbeitete Datei anzeigen
+        if st.session_state.last_processed_file:
+            st.markdown("---")
+            st.subheader("📄 Zuletzt verarbeitet")
+            st.info(f"**{st.session_state.last_processed_file}**")
+            st.caption("Diese Akte wurde zuletzt analysiert.")
 
         # Modell-Auswahl
         gpt_model = st.selectbox(
@@ -1511,6 +1520,7 @@ def main():
                                             df = cases_list_to_dataframe(cases)
                                             df = normalize_case_df(df, fachgebiet)
                                             all_cases.append(df)
+                                            st.session_state.last_processed_file = pdf_file.name
                                             st.success(f"✓ {pdf_file.name}: **{len(cases)} Fälle** erkannt")
 
                                             with st.expander(f"Details: {pdf_file.name}"):
@@ -1651,6 +1661,7 @@ def main():
                                                             df = cases_list_to_dataframe(cases)
                                                             df = normalize_case_df(df, fachgebiet)
                                                             all_folder_cases.append(df)
+                                                            st.session_state.last_processed_file = file_name
                                                             st.success(f"✓ {len(cases)} Fälle aus {file_name}")
                                                         else:
                                                             st.warning(f"⚠️ {file_name}: Keine Fälle erkannt")
@@ -1761,6 +1772,7 @@ def main():
                                                     df = cases_list_to_dataframe(total_cases)
                                                     df = normalize_case_df(df, fachgebiet)
                                                     all_cases.append(df)
+                                                    st.session_state.last_processed_file = f"Cloud-Dokument ({provider})"
                                                     st.success(f"✓ **{len(total_cases)} Fälle** aus Cloud-Dokument extrahiert!")
 
                                                     with st.expander("Erkannte Fälle anzeigen"):
