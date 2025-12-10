@@ -12,7 +12,7 @@ Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 # =============================================================================
 # VERSION
 # =============================================================================
-APP_VERSION = "25.12.10-19:45"
+APP_VERSION = "25.12.10-20:15"
 
 import streamlit as st
 import pandas as pd
@@ -1805,16 +1805,18 @@ def main():
 
                                         total_progress.progress((file_idx + 1) / len(folder_files))
 
-                                    # Alle Fälle zusammenführen
+                                    # Alle Fälle zusammenführen und in Session State speichern
                                     if all_folder_cases:
-                                        all_cases.extend(all_folder_cases)
                                         total_count = sum(len(df) for df in all_folder_cases)
                                         st.success(f"✅ **Ordner-Verarbeitung abgeschlossen!** "
                                                  f"Insgesamt {total_count} Fälle aus {len(all_folder_cases)} Dateien extrahiert.")
 
+                                        # Fälle zu all_cases hinzufügen (für normale Weiterverarbeitung)
+                                        all_cases.extend(all_folder_cases)
+
                                         # Ordner-Cache leeren
                                         st.session_state.folder_files = []
-                                        st.rerun()
+                                        # KEIN st.rerun() - lasse normalen Ablauf weiterlaufen für Auswertung
                                     else:
                                         st.warning("⚠️ Keine Fälle in den Dateien gefunden.")
 
