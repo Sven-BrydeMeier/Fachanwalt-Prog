@@ -12,7 +12,7 @@ Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 # =============================================================================
 # VERSION
 # =============================================================================
-APP_VERSION = "25.12.10-14:30"
+APP_VERSION = "25.12.10-15:00"
 
 import streamlit as st
 import pandas as pd
@@ -29,12 +29,12 @@ from urllib.parse import urlparse, parse_qs
 # UPLOAD-LIMITS FÜR STREAMLIT CLOUD
 # =============================================================================
 
-# Maximale Dateigröße pro Upload in Bytes (50 MB für Stabilität)
-MAX_FILE_SIZE_MB = 50
+# Maximale Dateigröße pro Upload in Bytes (100 MB pro Datei)
+MAX_FILE_SIZE_MB = 100
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
-# Maximale Gesamtgröße aller Uploads in einer Session (200 MB)
-MAX_TOTAL_UPLOAD_MB = 200
+# Maximale Gesamtgröße aller Uploads in einer Session (500 MB)
+MAX_TOTAL_UPLOAD_MB = 500
 MAX_TOTAL_UPLOAD_BYTES = MAX_TOTAL_UPLOAD_MB * 1024 * 1024
 
 # Chunk-Größe für Cloud-Downloads (5 MB)
