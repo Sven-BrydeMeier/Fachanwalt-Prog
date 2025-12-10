@@ -12,7 +12,7 @@ Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 # =============================================================================
 # VERSION
 # =============================================================================
-APP_VERSION = "25.12.10-19:15"
+APP_VERSION = "25.12.10-19:45"
 
 import streamlit as st
 import pandas as pd
@@ -1155,27 +1155,131 @@ def create_excel(fl1_df: pd.DataFrame, fl2_df: pd.DataFrame,
                  unprocessed_files: List[Dict] = None,
                  unrecognized_texts: List[Dict] = None) -> bytes:
     """Erstellt Excel-Arbeitsmappe mit Falllisten, Summary und Problemfällen."""
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
     output = BytesIO()
 
+    # Farben definieren
+    header_fill_blue = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    header_fill_green = PatternFill(start_color="2E7D32", end_color="2E7D32", fill_type="solid")
+    header_fill_orange = PatternFill(start_color="E65100", end_color="E65100", fill_type="solid")
+    header_fill_red = PatternFill(start_color="C62828", end_color="C62828", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    normal_font = Font(size=10)
+    border = Border(
+        left=Side(style='thin', color='CCCCCC'),
+        right=Side(style='thin', color='CCCCCC'),
+        top=Side(style='thin', color='CCCCCC'),
+        bottom=Side(style='thin', color='CCCCCC')
+    )
+
+    def format_worksheet(ws, header_fill, column_widths=None):
+        """Formatiert ein Arbeitsblatt mit Header-Farben, Filtern und Spaltenbreiten."""
+        if ws.max_row < 1:
+            return
+
+        # Header formatieren (erste Zeile)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            cell.border = border
+
+        # Autofilter aktivieren (Dropdown-Sortierung)
+        if ws.max_row > 1:
+            ws.auto_filter.ref = ws.dimensions
+
+        # Datenzeilen formatieren
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for cell in row:
+                cell.font = normal_font
+                cell.border = border
+                cell.alignment = Alignment(vertical='top', wrap_text=False)
+
+        # Spaltenbreiten setzen
+        if column_widths:
+            for col_idx, width in column_widths.items():
+                col_letter = get_column_letter(col_idx)
+                ws.column_dimensions[col_letter].width = width
+        else:
+            # Automatische Spaltenbreiten
+            for col_idx in range(1, ws.max_column + 1):
+                col_letter = get_column_letter(col_idx)
+                max_length = 0
+                column_header = ws.cell(row=1, column=col_idx).value
+
+                # Sachverhalt-Spalte breiter und mit Zeilenumbruch
+                if column_header and 'Sachverhalt' in str(column_header):
+                    ws.column_dimensions[col_letter].width = 50
+                    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=col_idx, max_col=col_idx):
+                        for cell in row:
+                            cell.alignment = Alignment(vertical='top', wrap_text=True)
+                    continue
+
+                # Andere Spalten automatisch anpassen
+                for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
+                    for cell in row:
+                        try:
+                            if cell.value:
+                                max_length = max(max_length, len(str(cell.value)))
+                        except:
+                            pass
+
+                # Breite begrenzen
+                adjusted_width = min(max_length + 2, 30)
+                adjusted_width = max(adjusted_width, 10)
+                ws.column_dimensions[col_letter].width = adjusted_width
+
+        # Zeile fixieren (Header bleibt sichtbar beim Scrollen)
+        ws.freeze_panes = 'A2'
+
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Fallliste 1 (gerichtlich) - Blau
         fl1_export = prepare_fl1_for_export(fl1_df) if len(fl1_df) > 0 else pd.DataFrame()
         fl1_export.to_excel(writer, sheet_name="Fallliste_1", index=False)
 
+        # Fallliste 2 (außergerichtlich) - Grün
         fl2_export = prepare_fl2_for_export(fl2_df) if len(fl2_df) > 0 else pd.DataFrame()
         fl2_export.to_excel(writer, sheet_name="Fallliste_2", index=False)
 
+        # Summary - Blau
         summary_df = create_summary_df(summary)
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
 
-        # Nicht verarbeitete Dateien (z.B. wegen Größe oder Fehler)
+        # Nicht verarbeitete Dateien - Orange
         if unprocessed_files:
             unprocessed_df = pd.DataFrame(unprocessed_files)
             unprocessed_df.to_excel(writer, sheet_name="Nicht_verarbeitet", index=False)
 
-        # Nicht erkannte Fälle (Texte ohne extrahierte Fälle)
+        # Nicht erkannte Fälle - Rot
         if unrecognized_texts:
             unrecognized_df = pd.DataFrame(unrecognized_texts)
             unrecognized_df.to_excel(writer, sheet_name="Nicht_erkannt", index=False)
+
+        # Workbook holen und Formatierung anwenden
+        workbook = writer.book
+
+        # Fallliste 1 formatieren
+        if "Fallliste_1" in workbook.sheetnames:
+            format_worksheet(workbook["Fallliste_1"], header_fill_blue)
+
+        # Fallliste 2 formatieren
+        if "Fallliste_2" in workbook.sheetnames:
+            format_worksheet(workbook["Fallliste_2"], header_fill_green)
+
+        # Summary formatieren
+        if "Summary" in workbook.sheetnames:
+            ws_summary = workbook["Summary"]
+            format_worksheet(ws_summary, header_fill_blue, {1: 35, 2: 20, 3: 40})
+
+        # Nicht verarbeitet formatieren
+        if "Nicht_verarbeitet" in workbook.sheetnames:
+            format_worksheet(workbook["Nicht_verarbeitet"], header_fill_orange)
+
+        # Nicht erkannt formatieren
+        if "Nicht_erkannt" in workbook.sheetnames:
+            format_worksheet(workbook["Nicht_erkannt"], header_fill_red)
 
     return output.getvalue()
 
