@@ -12,7 +12,7 @@ Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 # =============================================================================
 # VERSION
 # =============================================================================
-APP_VERSION = "25.12.10-16:00"
+APP_VERSION = "25.12.10-18:30"
 
 import streamlit as st
 import pandas as pd
@@ -298,13 +298,20 @@ def parse_cloud_link(url: str) -> Tuple[Optional[str], Optional[str]]:
 
     Returns:
         Tuple[Optional[str], Optional[str]]: (provider, download_url oder file_id)
+        Provider kann sein: "google_drive", "google_drive_folder", "dropbox", "icloud"
     """
     url = url.strip()
     parsed = urlparse(url)
 
     # Google Drive
     if "drive.google.com" in parsed.netloc:
-        # Format: https://drive.google.com/file/d/FILE_ID/view
+        # Ordner-Format: https://drive.google.com/drive/folders/FOLDER_ID
+        if "/folders/" in url:
+            parts = url.split("/folders/")
+            if len(parts) > 1:
+                folder_id = parts[1].split("/")[0].split("?")[0]
+                return "google_drive_folder", folder_id
+        # Datei-Format: https://drive.google.com/file/d/FILE_ID/view
         if "/file/d/" in url:
             parts = url.split("/file/d/")
             if len(parts) > 1:
@@ -333,6 +340,106 @@ def parse_cloud_link(url: str) -> Tuple[Optional[str], Optional[str]]:
         return "dropbox", direct_url
 
     return None, None
+
+
+def list_google_drive_folder(folder_id: str) -> List[Dict[str, str]]:
+    """
+    Listet alle PDF-Dateien in einem öffentlichen Google Drive Ordner auf.
+
+    Returns:
+        Liste von Dictionaries mit 'id', 'name' für jede PDF-Datei
+    """
+    # Google Drive API für öffentliche Ordner
+    # Verwendet die eingebettete Ansicht, um Dateiliste zu erhalten
+    api_url = f"https://drive.google.com/embeddedfolderview?id={folder_id}"
+
+    try:
+        response = requests.get(api_url, timeout=30)
+        if response.status_code != 200:
+            return []
+
+        # HTML parsen um Datei-IDs zu extrahieren
+        content = response.text
+        files = []
+
+        # Suche nach Datei-Links im Format /file/d/FILE_ID
+        import re
+        file_pattern = r'/file/d/([a-zA-Z0-9_-]+)'
+        file_ids = set(re.findall(file_pattern, content))
+
+        # Auch nach Dateinamen suchen
+        name_pattern = r'aria-label="([^"]+\.pdf)"'
+        file_names = re.findall(name_pattern, content, re.IGNORECASE)
+
+        # Alternative: Suche nach flip-entry divs
+        entry_pattern = r'data-id="([^"]+)"[^>]*>.*?<div class="flip-entry-title">([^<]+)</div>'
+
+        for file_id in file_ids:
+            files.append({
+                'id': file_id,
+                'name': f'Datei_{file_id[:8]}.pdf'  # Placeholder-Name
+            })
+
+        # Wenn keine Dateien gefunden, versuche alternative Methode
+        if not files:
+            # Versuche über die Google Drive API (ohne Auth für öffentliche Ordner)
+            api_url2 = f"https://www.googleapis.com/drive/v3/files?q='{folder_id}'+in+parents&fields=files(id,name,mimeType)"
+            try:
+                resp2 = requests.get(api_url2, timeout=30)
+                if resp2.status_code == 200:
+                    data = resp2.json()
+                    for f in data.get('files', []):
+                        if f.get('mimeType') == 'application/pdf' or f.get('name', '').lower().endswith('.pdf'):
+                            files.append({'id': f['id'], 'name': f['name']})
+            except:
+                pass
+
+        return files
+
+    except Exception as e:
+        st.error(f"Fehler beim Laden des Ordners: {str(e)}")
+        return []
+
+
+def get_google_drive_folder_files_via_webpage(folder_id: str) -> List[Dict[str, str]]:
+    """
+    Alternative Methode: Lädt Ordnerinhalt über die Webseite.
+    """
+    files = []
+
+    # Versuche über die normale Drive-Ansicht
+    url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=30)
+
+        if response.status_code == 200:
+            import re
+            # Suche nach Datei-IDs und Namen
+            # Google Drive speichert Daten in JavaScript-Objekten
+            content = response.text
+
+            # Muster für Datei-Einträge
+            file_pattern = r'\["([a-zA-Z0-9_-]{25,})","([^"]+\.pdf)"'
+            matches = re.findall(file_pattern, content, re.IGNORECASE)
+
+            for file_id, file_name in matches:
+                files.append({'id': file_id, 'name': file_name})
+
+            # Fallback: Nur IDs extrahieren
+            if not files:
+                id_pattern = r'/file/d/([a-zA-Z0-9_-]{25,})'
+                ids = set(re.findall(id_pattern, content))
+                for idx, fid in enumerate(ids):
+                    files.append({'id': fid, 'name': f'Datei_{idx+1}.pdf'})
+
+    except Exception as e:
+        pass
+
+    return files
 
 
 def download_from_google_drive(file_id: str, progress_callback=None) -> Optional[BytesIO]:
@@ -1044,8 +1151,10 @@ def create_summary_df(summary: Dict[str, Any]) -> pd.DataFrame:
 
 
 def create_excel(fl1_df: pd.DataFrame, fl2_df: pd.DataFrame,
-                 summary: Dict[str, Any], fachgebiet: str) -> bytes:
-    """Erstellt Excel-Arbeitsmappe mit Falllisten und Summary."""
+                 summary: Dict[str, Any], fachgebiet: str,
+                 unprocessed_files: List[Dict] = None,
+                 unrecognized_texts: List[Dict] = None) -> bytes:
+    """Erstellt Excel-Arbeitsmappe mit Falllisten, Summary und Problemfällen."""
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -1057,6 +1166,16 @@ def create_excel(fl1_df: pd.DataFrame, fl2_df: pd.DataFrame,
 
         summary_df = create_summary_df(summary)
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
+
+        # Nicht verarbeitete Dateien (z.B. wegen Größe oder Fehler)
+        if unprocessed_files:
+            unprocessed_df = pd.DataFrame(unprocessed_files)
+            unprocessed_df.to_excel(writer, sheet_name="Nicht_verarbeitet", index=False)
+
+        # Nicht erkannte Fälle (Texte ohne extrahierte Fälle)
+        if unrecognized_texts:
+            unrecognized_df = pd.DataFrame(unrecognized_texts)
+            unrecognized_df.to_excel(writer, sheet_name="Nicht_erkannt", index=False)
 
     return output.getvalue()
 
@@ -1184,6 +1303,10 @@ def main():
         st.session_state.upload_key = 0
     if "pending_duplicates" not in st.session_state:
         st.session_state.pending_duplicates = []
+    if "unprocessed_files" not in st.session_state:
+        st.session_state.unprocessed_files = []  # Dateien die nicht verarbeitet werden konnten
+    if "unrecognized_texts" not in st.session_state:
+        st.session_state.unrecognized_texts = []  # Texte ohne erkannte Fälle
 
     # Sidebar
     with st.sidebar:
@@ -1322,6 +1445,13 @@ def main():
                         files_to_process.append(pdf_file)
                     else:
                         rejected_files.append((pdf_file.name, error_msg))
+                        # Zu unprocessed_files hinzufügen
+                        st.session_state.unprocessed_files.append({
+                            "Dateiname": pdf_file.name,
+                            "Grund": error_msg,
+                            "Typ": "Größenlimit überschritten",
+                            "Zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
+                        })
 
                 # Gesamtgröße prüfen
                 if files_to_process:
@@ -1331,6 +1461,14 @@ def main():
                     if not total_ok:
                         st.error(f"⚠️ {total_error}")
                         st.warning("Tipp: Nutzen Sie den **Cloud-Link Tab** für große Datenmengen!")
+                        # Alle Dateien als nicht verarbeitet markieren
+                        for f in files_to_process:
+                            st.session_state.unprocessed_files.append({
+                                "Dateiname": f.name,
+                                "Grund": total_error,
+                                "Typ": "Gesamtlimit überschritten",
+                                "Zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
+                            })
                         files_to_process = []
 
                 # Abgelehnte Dateien anzeigen
@@ -1353,6 +1491,13 @@ def main():
 
                                         if len(pdf_text.strip()) < 50:
                                             st.warning(f"⚠️ {pdf_file.name}: Wenig Text gefunden. Gescanntes PDF?")
+                                            # Als nicht erkannt dokumentieren
+                                            st.session_state.unrecognized_texts.append({
+                                                "Dateiname": pdf_file.name,
+                                                "Grund": "Wenig oder kein Text extrahiert (möglicherweise gescanntes PDF)",
+                                                "Textlänge": len(pdf_text.strip()),
+                                                "Zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
+                                            })
                                             continue
 
                                         cases = analyze_cases_with_gpt(
@@ -1376,9 +1521,24 @@ def main():
                                                 )
                                         else:
                                             st.warning(f"⚠️ {pdf_file.name}: Keine Fälle erkannt")
+                                            # Als nicht erkannt dokumentieren mit Textauszug
+                                            st.session_state.unrecognized_texts.append({
+                                                "Dateiname": pdf_file.name,
+                                                "Grund": "Keine Fälle von GPT erkannt",
+                                                "Textauszug": pdf_text[:500] + "..." if len(pdf_text) > 500 else pdf_text,
+                                                "Textlänge": len(pdf_text),
+                                                "Zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
+                                            })
 
                                     except Exception as e:
                                         st.error(f"✗ {pdf_file.name}: {str(e)}")
+                                        # Fehler dokumentieren
+                                        st.session_state.unprocessed_files.append({
+                                            "Dateiname": pdf_file.name,
+                                            "Grund": str(e),
+                                            "Typ": "Verarbeitungsfehler",
+                                            "Zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
+                                        })
 
                                 progress_bar.progress((i + 1) / len(files_to_process))
 
@@ -1396,9 +1556,12 @@ def main():
         **Ideal für große Datenmengen!** Die Dateien werden in Paketen heruntergeladen und verarbeitet.
 
         **Unterstützte Anbieter:**
-        - **Google Drive**: Datei freigeben → "Jeder mit dem Link" → Link kopieren
+        - **Google Drive**: Datei **oder Ordner** freigeben → "Jeder mit dem Link" → Link kopieren
         - **Dropbox**: Datei freigeben → Link kopieren
         - **iCloud**: *Derzeit nicht direkt unterstützt* (bitte Datei herunterladen und normal hochladen)
+
+        **Tipp:** Bei Google Drive können Sie auch einen **ganzen Ordner** mit mehreren PDF-Dateien freigeben.
+        Die App verarbeitet dann alle PDF-Dateien nacheinander.
         """)
 
         if not st.session_state.openai_api_key:
@@ -1406,7 +1569,7 @@ def main():
         else:
             cloud_url = st.text_input(
                 "Freigabe-Link eingeben",
-                placeholder="https://drive.google.com/file/d/... oder https://www.dropbox.com/...",
+                placeholder="https://drive.google.com/file/d/... oder .../folders/... oder https://www.dropbox.com/...",
                 help="Der Link muss öffentlich zugänglich sein (Freigabe für 'Jeder mit dem Link')"
             )
 
@@ -1415,81 +1578,206 @@ def main():
                 provider, identifier = parse_cloud_link(cloud_url)
 
                 if provider:
-                    st.success(f"✓ Erkannt: **{provider.replace('_', ' ').title()}**")
+                    # Anzeige anpassen für Ordner
+                    if provider == "google_drive_folder":
+                        st.success(f"✓ Erkannt: **Google Drive Ordner**")
+                        st.info("📁 Ordner-Link erkannt. Alle PDF-Dateien werden nacheinander verarbeitet.")
+                    else:
+                        st.success(f"✓ Erkannt: **{provider.replace('_', ' ').title()}**")
 
-                    if st.button("☁️ Von Cloud laden und analysieren", type="primary", use_container_width=True):
-                        with st.spinner("Lade Datei von Cloud..."):
-                            progress_placeholder = st.empty()
+                    # Google Drive Ordner: Liste Dateien auf
+                    if provider == "google_drive_folder":
+                        if st.button("📁 Ordner-Inhalt laden", type="secondary"):
+                            with st.spinner("Lade Ordner-Inhalt..."):
+                                # Versuche beide Methoden
+                                folder_files = list_google_drive_folder(identifier)
+                                if not folder_files:
+                                    folder_files = get_google_drive_folder_files_via_webpage(identifier)
 
-                            def update_progress(progress):
-                                progress_placeholder.progress(progress, text=f"Download: {progress*100:.0f}%")
+                                if folder_files:
+                                    st.session_state.folder_files = folder_files
+                                    st.success(f"✓ {len(folder_files)} PDF-Datei(en) gefunden!")
+                                else:
+                                    st.warning("⚠️ Keine PDF-Dateien gefunden oder Ordner nicht zugänglich. "
+                                             "Stellen Sie sicher, dass der Ordner öffentlich freigegeben ist.")
 
-                            buffer, error = download_from_cloud(cloud_url, update_progress)
+                        # Wenn Dateien gefunden, anzeigen und verarbeiten
+                        if "folder_files" in st.session_state and st.session_state.folder_files:
+                            folder_files = st.session_state.folder_files
 
-                            if buffer:
-                                progress_placeholder.empty()
-                                st.success("✓ Download abgeschlossen!")
+                            st.markdown(f"**Gefundene Dateien ({len(folder_files)}):**")
+                            for idx, f in enumerate(folder_files[:20]):  # Max 20 anzeigen
+                                st.text(f"  {idx+1}. {f['name']}")
+                            if len(folder_files) > 20:
+                                st.text(f"  ... und {len(folder_files) - 20} weitere")
 
-                                # Prüfen ob PDF
-                                try:
-                                    with st.spinner("Extrahiere Text aus PDF..."):
-                                        pdf_text = extract_text_from_pdf(buffer)
+                            if st.button("☁️ Alle Dateien verarbeiten", type="primary", use_container_width=True):
+                                client = get_openai_client(st.session_state.openai_api_key)
+                                if not client:
+                                    st.error("OpenAI-Client konnte nicht initialisiert werden.")
+                                else:
+                                    total_progress = st.progress(0, text="Verarbeite Dateien...")
+                                    all_folder_cases = []
 
-                                    if len(pdf_text.strip()) < 50:
-                                        st.warning("⚠️ Wenig Text gefunden. Gescanntes PDF?")
+                                    for file_idx, file_info in enumerate(folder_files):
+                                        file_id = file_info['id']
+                                        file_name = file_info['name']
+
+                                        st.write(f"📄 Verarbeite: **{file_name}** ({file_idx+1}/{len(folder_files)})")
+
+                                        try:
+                                            # Download
+                                            buffer = download_from_google_drive(file_id)
+
+                                            if buffer:
+                                                # Text extrahieren
+                                                try:
+                                                    pdf_text = extract_text_from_pdf(buffer)
+
+                                                    if len(pdf_text.strip()) < 50:
+                                                        st.warning(f"⚠️ {file_name}: Wenig Text gefunden")
+                                                        st.session_state.unrecognized_texts.append({
+                                                            "Dateiname": file_name,
+                                                            "Grund": "Wenig Text extrahiert (< 50 Zeichen)",
+                                                            "Textauszug": pdf_text[:200] if pdf_text else "Kein Text",
+                                                            "Textlänge": len(pdf_text),
+                                                            "Zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
+                                                        })
+                                                    else:
+                                                        # GPT-Analyse
+                                                        cases = analyze_cases_with_gpt(client, pdf_text, fachgebiet, model=gpt_model)
+
+                                                        if cases:
+                                                            df = cases_list_to_dataframe(cases)
+                                                            df = normalize_case_df(df, fachgebiet)
+                                                            all_folder_cases.append(df)
+                                                            st.success(f"✓ {len(cases)} Fälle aus {file_name}")
+                                                        else:
+                                                            st.warning(f"⚠️ {file_name}: Keine Fälle erkannt")
+                                                            st.session_state.unrecognized_texts.append({
+                                                                "Dateiname": file_name,
+                                                                "Grund": "Keine Fälle von GPT erkannt",
+                                                                "Textauszug": pdf_text[:500] + "..." if len(pdf_text) > 500 else pdf_text,
+                                                                "Textlänge": len(pdf_text),
+                                                                "Zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
+                                                            })
+
+                                                except Exception as e:
+                                                    st.error(f"❌ {file_name}: Fehler bei Verarbeitung - {str(e)}")
+                                                    st.session_state.unprocessed_files.append({
+                                                        "Dateiname": file_name,
+                                                        "Grund": f"Verarbeitungsfehler: {str(e)}",
+                                                        "Typ": "PDF-Fehler",
+                                                        "Zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
+                                                    })
+                                            else:
+                                                st.warning(f"⚠️ {file_name}: Download fehlgeschlagen")
+                                                st.session_state.unprocessed_files.append({
+                                                    "Dateiname": file_name,
+                                                    "Grund": "Download fehlgeschlagen",
+                                                    "Typ": "Download-Fehler",
+                                                    "Zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
+                                                })
+
+                                        except Exception as e:
+                                            st.error(f"❌ {file_name}: {str(e)}")
+                                            st.session_state.unprocessed_files.append({
+                                                "Dateiname": file_name,
+                                                "Grund": str(e),
+                                                "Typ": "Allgemeiner Fehler",
+                                                "Zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
+                                            })
+
+                                        total_progress.progress((file_idx + 1) / len(folder_files))
+
+                                    # Alle Fälle zusammenführen
+                                    if all_folder_cases:
+                                        all_cases.extend(all_folder_cases)
+                                        total_count = sum(len(df) for df in all_folder_cases)
+                                        st.success(f"✅ **Ordner-Verarbeitung abgeschlossen!** "
+                                                 f"Insgesamt {total_count} Fälle aus {len(all_folder_cases)} Dateien extrahiert.")
+
+                                        # Ordner-Cache leeren
+                                        st.session_state.folder_files = []
+                                        st.rerun()
                                     else:
-                                        client = get_openai_client(st.session_state.openai_api_key)
+                                        st.warning("⚠️ Keine Fälle in den Dateien gefunden.")
 
-                                        if client:
-                                            # Text in Chunks aufteilen für große Dokumente
-                                            text_chunks = []
-                                            chunk_size = 10000  # Zeichen pro Chunk
+                    else:
+                        # Einzelne Datei (wie bisher)
+                        if st.button("☁️ Von Cloud laden und analysieren", type="primary", use_container_width=True):
+                            with st.spinner("Lade Datei von Cloud..."):
+                                progress_placeholder = st.empty()
 
-                                            if len(pdf_text) > chunk_size:
-                                                st.info(f"📄 Großes Dokument erkannt ({len(pdf_text)} Zeichen). Verarbeite in Paketen...")
+                                def update_progress(progress):
+                                    progress_placeholder.progress(progress, text=f"Download: {progress*100:.0f}%")
 
-                                                for i in range(0, len(pdf_text), chunk_size):
-                                                    text_chunks.append(pdf_text[i:i+chunk_size])
-                                            else:
-                                                text_chunks = [pdf_text]
+                                buffer, error = download_from_cloud(cloud_url, update_progress)
 
-                                            total_cases = []
-                                            chunk_progress = st.progress(0)
+                                if buffer:
+                                    progress_placeholder.empty()
+                                    st.success("✓ Download abgeschlossen!")
 
-                                            for idx, chunk in enumerate(text_chunks):
-                                                with st.spinner(f"Analysiere Paket {idx+1}/{len(text_chunks)}..."):
-                                                    cases = analyze_cases_with_gpt(
-                                                        client,
-                                                        chunk,
-                                                        fachgebiet,
-                                                        model=gpt_model
-                                                    )
-                                                    if cases:
-                                                        total_cases.extend(cases)
+                                    # Prüfen ob PDF
+                                    try:
+                                        with st.spinner("Extrahiere Text aus PDF..."):
+                                            pdf_text = extract_text_from_pdf(buffer)
 
-                                                chunk_progress.progress((idx + 1) / len(text_chunks))
+                                        if len(pdf_text.strip()) < 50:
+                                            st.warning("⚠️ Wenig Text gefunden. Gescanntes PDF?")
+                                        else:
+                                            client = get_openai_client(st.session_state.openai_api_key)
 
-                                            if total_cases:
-                                                df = cases_list_to_dataframe(total_cases)
-                                                df = normalize_case_df(df, fachgebiet)
-                                                all_cases.append(df)
-                                                st.success(f"✓ **{len(total_cases)} Fälle** aus Cloud-Dokument extrahiert!")
+                                            if client:
+                                                # Text in Chunks aufteilen für große Dokumente
+                                                text_chunks = []
+                                                chunk_size = 10000  # Zeichen pro Chunk
 
-                                                with st.expander("Erkannte Fälle anzeigen"):
-                                                    st.dataframe(
-                                                        df[["kurzrubrum", "sachverhalt", "verfahrenstyp", "bereich_nr"]],
-                                                        use_container_width=True,
-                                                        hide_index=True
-                                                    )
-                                            else:
-                                                st.warning("⚠️ Keine Fälle im Dokument erkannt")
+                                                if len(pdf_text) > chunk_size:
+                                                    st.info(f"📄 Großes Dokument erkannt ({len(pdf_text)} Zeichen). Verarbeite in Paketen...")
 
-                                except Exception as e:
-                                    st.error(f"Fehler bei der Verarbeitung: {str(e)}")
-                            else:
-                                st.error(f"❌ {error}")
+                                                    for i in range(0, len(pdf_text), chunk_size):
+                                                        text_chunks.append(pdf_text[i:i+chunk_size])
+                                                else:
+                                                    text_chunks = [pdf_text]
+
+                                                total_cases = []
+                                                chunk_progress = st.progress(0)
+
+                                                for idx, chunk in enumerate(text_chunks):
+                                                    with st.spinner(f"Analysiere Paket {idx+1}/{len(text_chunks)}..."):
+                                                        cases = analyze_cases_with_gpt(
+                                                            client,
+                                                            chunk,
+                                                            fachgebiet,
+                                                            model=gpt_model
+                                                        )
+                                                        if cases:
+                                                            total_cases.extend(cases)
+
+                                                    chunk_progress.progress((idx + 1) / len(text_chunks))
+
+                                                if total_cases:
+                                                    df = cases_list_to_dataframe(total_cases)
+                                                    df = normalize_case_df(df, fachgebiet)
+                                                    all_cases.append(df)
+                                                    st.success(f"✓ **{len(total_cases)} Fälle** aus Cloud-Dokument extrahiert!")
+
+                                                    with st.expander("Erkannte Fälle anzeigen"):
+                                                        st.dataframe(
+                                                            df[["kurzrubrum", "sachverhalt", "verfahrenstyp", "bereich_nr"]],
+                                                            use_container_width=True,
+                                                            hide_index=True
+                                                        )
+                                                else:
+                                                    st.warning("⚠️ Keine Fälle im Dokument erkannt")
+
+                                    except Exception as e:
+                                        st.error(f"Fehler bei der Verarbeitung: {str(e)}")
+                                else:
+                                    st.error(f"❌ {error}")
                 else:
-                    st.warning("⚠️ Link nicht erkannt. Bitte einen gültigen Google Drive oder Dropbox Link eingeben.")
+                    st.warning("⚠️ Link nicht erkannt. Bitte einen gültigen Google Drive (Datei oder Ordner) oder Dropbox Link eingeben.")
 
     # Tab 2: Manueller Eintrag
     with tab_manual:
@@ -1797,9 +2085,15 @@ Im Januar 2024 beauftragte mich Mandant A mit der Durchsetzung seiner Erbansprü
     - **Fallliste 1**: Gerichtliche/rechtsförmliche Verfahren
     - **Fallliste 2**: Außergerichtliche Verfahren
     - **Summary**: Übersicht mit FAO-Check und Statistiken
+    - **Nicht_verarbeitet**: Dateien die nicht verarbeitet werden konnten (z.B. zu groß)
+    - **Nicht_erkannt**: Texte aus denen keine Fälle extrahiert werden konnten
     """)
 
-    excel_bytes = create_excel(fl1, fl2, summary, fachgebiet)
+    excel_bytes = create_excel(
+        fl1, fl2, summary, fachgebiet,
+        unprocessed_files=st.session_state.unprocessed_files,
+        unrecognized_texts=st.session_state.unrecognized_texts
+    )
     filename = f"Fallliste_{fachgebiet.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
     col1, col2, col3 = st.columns([2, 1, 1])
