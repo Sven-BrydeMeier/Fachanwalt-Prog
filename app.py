@@ -12,7 +12,7 @@ Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 # =============================================================================
 # VERSION
 # =============================================================================
-APP_VERSION = "25.12.09-22:09"
+APP_VERSION = "25.12.10-14:30"
 
 import streamlit as st
 import pandas as pd
@@ -503,7 +503,10 @@ Deine Aufgabe ist es, aus dem gegebenen Text alle rechtlichen Fälle zu extrahie
 Für jeden Fall extrahiere folgende Informationen (falls vorhanden):
 - kanzlei_az: Kanzlei-Aktenzeichen
 - kurzrubrum: Anonymisiertes Rubrum (z.B. "A ./. B")
-- sachverhalt: WICHTIG - Inhaltliche Kurzbeschreibung des Falls in 4-6 Sätzen. Beschreibe den rechtlichen Sachverhalt, die Ausgangslage, den Streitgegenstand und ggf. das Ergebnis. Keine Standardfloskeln!
+- sachverhalt: PFLICHTFELD! Schreibe IMMER eine inhaltliche Kurzbeschreibung des Falls in GENAU 4-6 Sätzen.
+  Beschreibe konkret: 1) Ausgangssituation/Mandant, 2) Streitgegenstand/Problem, 3) Vorgehensweise/Verfahren,
+  4) Ergebnis/Ausgang. KEINE Standardfloskeln wie "Beratung und Vertretung". Jeder Fall braucht eine
+  individuelle, aussagekräftige Beschreibung des rechtlichen Sachverhalts!
 - zeitraum_von: Beginn (Format: MM/YYYY)
 - zeitraum_bis: Ende (Format: MM/YYYY)
 - gericht_az: Gerichtsaktenzeichen (falls vorhanden)
@@ -516,6 +519,8 @@ Für jeden Fall extrahiere folgende Informationen (falls vorhanden):
 - stand: "anhaengig" oder "abgeschlossen"
 - abschluss_art: z.B. "Urteil", "Vergleich", "Beschluss"
 - abschluss_datum: Datum (Format: TT.MM.YYYY)
+
+WICHTIG: Das Feld "sachverhalt" ist das wichtigste Feld! Es MUSS für jeden Fall 4-6 aussagekräftige Sätze enthalten!
 
 Antworte NUR mit einem JSON-Array von Objekten. Keine zusätzliche Erklärung."""
 
@@ -597,7 +602,12 @@ Bereiche:
 Analysiere den Fall und gib ein JSON-Objekt mit diesen Feldern zurück:
 - kanzlei_az: Kanzlei-Aktenzeichen (generiere eines falls nicht vorhanden)
 - kurzrubrum: Anonymisiertes Rubrum (z.B. "A ./. B")
-- sachverhalt: WICHTIG - Inhaltliche Kurzbeschreibung in 4-6 Sätzen. Beschreibe Ausgangslage, Streitgegenstand, Verlauf und Ergebnis. Keine Standardfloskeln!
+- sachverhalt: PFLICHTFELD! Schreibe GENAU 4-6 Sätze mit konkreter Sachverhaltsbeschreibung:
+  1) Wer ist der Mandant und was war die Ausgangslage?
+  2) Was war der Streitgegenstand/das rechtliche Problem?
+  3) Wie wurde vorgegangen (außergerichtlich/gerichtlich)?
+  4) Wie endete der Fall?
+  KEINE Standardfloskeln! Jeder Fall braucht eine individuelle Beschreibung!
 - zeitraum_von, zeitraum_bis: Format MM/YYYY
 - gericht_az: Gerichtsaktenzeichen (falls vorhanden)
 - verfahrenstyp: "gerichtlich", "rechtsfoermlich" oder "aussergerichtlich"
@@ -607,6 +617,8 @@ Analysiere den Fall und gib ein JSON-Objekt mit diesen Feldern zurück:
 - taetigkeitsbeschreibung: Konkrete anwaltliche Tätigkeiten
 - stand: "anhaengig" oder "abgeschlossen"
 - abschluss_art, abschluss_datum
+
+Das Feld "sachverhalt" ist das WICHTIGSTE - es MUSS 4-6 aussagekräftige Sätze enthalten!
 
 Antworte NUR mit JSON, keine Erklärung."""
 
@@ -1310,7 +1322,7 @@ def main():
 
                                             with st.expander(f"Details: {pdf_file.name}"):
                                                 st.dataframe(
-                                                    df[["kurzrubrum", "verfahrenstyp", "bereich_nr", "bedeutung"]],
+                                                    df[["kurzrubrum", "sachverhalt", "verfahrenstyp", "bereich_nr"]],
                                                     use_container_width=True,
                                                     hide_index=True
                                                 )
@@ -1411,7 +1423,7 @@ def main():
 
                                                 with st.expander("Erkannte Fälle anzeigen"):
                                                     st.dataframe(
-                                                        df[["kurzrubrum", "verfahrenstyp", "bereich_nr", "bedeutung"]],
+                                                        df[["kurzrubrum", "sachverhalt", "verfahrenstyp", "bereich_nr"]],
                                                         use_container_width=True,
                                                         hide_index=True
                                                     )
@@ -1664,8 +1676,8 @@ Im Januar 2024 beauftragte mich Mandant A mit der Durchsetzung seiner Erbansprü
 
     with preview_tab1:
         if len(fl1) > 0:
-            display_cols = ["FL1_Nr", "kurzrubrum", "kanzlei_az", "gericht_az",
-                          "bereich_nr", "verfahrenstyp", "bedeutung", "stand"]
+            display_cols = ["FL1_Nr", "kurzrubrum", "sachverhalt", "kanzlei_az", "gericht_az",
+                          "bereich_nr", "verfahrenstyp", "stand"]
             display_cols = [c for c in display_cols if c in fl1.columns]
             st.dataframe(fl1[display_cols], use_container_width=True, hide_index=True)
         else:
@@ -1673,7 +1685,7 @@ Im Januar 2024 beauftragte mich Mandant A mit der Durchsetzung seiner Erbansprü
 
     with preview_tab2:
         if len(fl2) > 0:
-            display_cols = ["FL2_Nr", "kurzrubrum", "kanzlei_az", "bereich_nr", "bedeutung"]
+            display_cols = ["FL2_Nr", "kurzrubrum", "sachverhalt", "kanzlei_az", "bereich_nr"]
             display_cols = [c for c in display_cols if c in fl2.columns]
             st.dataframe(fl2[display_cols], use_container_width=True, hide_index=True)
         else:
