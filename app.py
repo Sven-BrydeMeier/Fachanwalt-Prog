@@ -12,7 +12,7 @@ Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 # =============================================================================
 # VERSION
 # =============================================================================
-APP_VERSION = "25.12.10-15:00"
+APP_VERSION = "25.12.10-16:00"
 
 import streamlit as st
 import pandas as pd
@@ -1122,6 +1122,32 @@ def get_status_symbol(status: str) -> str:
     return {"erfuellt": "✓", "knapp": "⚠️", "nicht_erfuellt": "✗"}.get(status, "?")
 
 
+def check_duplicates(new_cases: pd.DataFrame, existing_cases: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Prüft auf Duplikate anhand des Kanzlei-Aktenzeichens.
+
+    Returns:
+        Tuple[pd.DataFrame, pd.DataFrame]: (neue_faelle_ohne_duplikate, gefundene_duplikate)
+    """
+    if existing_cases.empty or new_cases.empty:
+        return new_cases, pd.DataFrame()
+
+    if "kanzlei_az" not in new_cases.columns or "kanzlei_az" not in existing_cases.columns:
+        return new_cases, pd.DataFrame()
+
+    # Bestehende Aktenzeichen sammeln
+    existing_az = set(existing_cases["kanzlei_az"].dropna().astype(str).str.strip().str.lower())
+    existing_az.discard("")  # Leere entfernen
+
+    # Duplikate finden
+    duplicates_mask = new_cases["kanzlei_az"].fillna("").astype(str).str.strip().str.lower().isin(existing_az)
+
+    duplicates = new_cases[duplicates_mask].copy()
+    non_duplicates = new_cases[~duplicates_mask].copy()
+
+    return non_duplicates, duplicates
+
+
 # =============================================================================
 # STREAMLIT APP
 # =============================================================================
@@ -1135,15 +1161,29 @@ def main():
         layout="wide"
     )
 
-    st.title("⚖️ Fachanwalt-Falllistenverwaltung")
-    st.caption(f"Version {APP_VERSION}")
-    st.markdown("**Erstellen Sie FAO-konforme Falllisten für Ihren Fachanwaltsantrag**")
+    # Header mit gut sichtbarer Versionsnummer
+    col_title, col_version = st.columns([4, 1])
+    with col_title:
+        st.title("⚖️ Fachanwalt-Falllistenverwaltung")
+        st.markdown("**Erstellen Sie FAO-konforme Falllisten für Ihren Fachanwaltsantrag**")
+    with col_version:
+        st.markdown(f"""
+        <div style="background-color: #1f77b4; color: white; padding: 10px 15px;
+                    border-radius: 8px; text-align: center; margin-top: 10px;">
+            <strong>Version</strong><br>
+            <span style="font-size: 1.2em;">{APP_VERSION}</span>
+        </div>
+        """, unsafe_allow_html=True)
 
     # Session State initialisieren
     if "cases_df" not in st.session_state:
         st.session_state.cases_df = pd.DataFrame()
     if "openai_api_key" not in st.session_state:
         st.session_state.openai_api_key = ""
+    if "upload_key" not in st.session_state:
+        st.session_state.upload_key = 0
+    if "pending_duplicates" not in st.session_state:
+        st.session_state.pending_duplicates = []
 
     # Sidebar
     with st.sidebar:
@@ -1170,6 +1210,14 @@ def main():
         if api_key:
             st.session_state.openai_api_key = api_key
             st.success("✓ API-Key aktiv")
+
+        # Aktuelle Fallanzahl anzeigen
+        st.markdown("---")
+        st.subheader("📊 Aktuelle Fallliste")
+        current_count = len(st.session_state.cases_df) if not st.session_state.cases_df.empty else 0
+        st.metric("Erfasste Fälle", current_count)
+        if current_count > 0:
+            st.caption("Die Fallliste wird bei jedem Upload erweitert.")
 
         # Modell-Auswahl
         gpt_model = st.selectbox(
@@ -1259,7 +1307,7 @@ def main():
                 "PDF-Dateien auswählen",
                 type=["pdf"],
                 accept_multiple_files=True,
-                key="pdf_upload",
+                key=f"pdf_upload_{st.session_state.upload_key}",
                 help=f"Sie können mehrere PDFs hochladen (max. {MAX_FILE_SIZE_MB} MB pro Datei)"
             )
 
@@ -1333,6 +1381,12 @@ def main():
                                         st.error(f"✗ {pdf_file.name}: {str(e)}")
 
                                 progress_bar.progress((i + 1) / len(files_to_process))
+
+                            # Nach erfolgreicher Analyse: Upload-Bereich zurücksetzen
+                            if all_cases:
+                                st.session_state.upload_key += 1
+                                st.success("✅ Analyse abgeschlossen! Upload-Bereich wurde geleert.")
+                                st.rerun()
 
     # Tab 2: Cloud-Link Upload (Google Drive, Dropbox, iCloud)
     with tab_cloud:
@@ -1539,16 +1593,56 @@ Im Januar 2024 beauftragte mich Mandant A mit der Durchsetzung seiner Erbansprü
     # FÄLLE VERARBEITEN UND ANZEIGEN
     # =========================================================================
 
-    # Alle neuen Fälle mit bestehenden kombinieren
+    # Alle neuen Fälle mit bestehenden kombinieren (mit Duplikat-Prüfung)
     if all_cases:
         new_combined = pd.concat(all_cases, ignore_index=True)
-        if not st.session_state.cases_df.empty:
-            st.session_state.cases_df = pd.concat(
-                [st.session_state.cases_df, new_combined],
-                ignore_index=True
-            )
-        else:
-            st.session_state.cases_df = new_combined
+
+        # Duplikat-Prüfung durchführen
+        non_duplicates, duplicates = check_duplicates(new_combined, st.session_state.cases_df)
+
+        # Duplikate zur manuellen Freigabe speichern
+        if not duplicates.empty:
+            st.session_state.pending_duplicates = duplicates.to_dict('records')
+
+        # Nur nicht-doppelte Fälle hinzufügen
+        if not non_duplicates.empty:
+            if not st.session_state.cases_df.empty:
+                st.session_state.cases_df = pd.concat(
+                    [st.session_state.cases_df, non_duplicates],
+                    ignore_index=True
+                )
+            else:
+                st.session_state.cases_df = non_duplicates
+
+    # Duplikat-Warnung anzeigen und manuelle Freigabe ermöglichen
+    if st.session_state.pending_duplicates:
+        st.markdown("---")
+        st.warning(f"⚠️ **{len(st.session_state.pending_duplicates)} Duplikat(e) gefunden!** Diese Aktenzeichen existieren bereits:")
+
+        for idx, dup in enumerate(st.session_state.pending_duplicates):
+            with st.expander(f"Duplikat: {dup.get('kanzlei_az', 'Unbekannt')} - {dup.get('kurzrubrum', '')}"):
+                st.json(dup)
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button(f"✅ Trotzdem hinzufügen", key=f"add_dup_{idx}"):
+                        new_df = pd.DataFrame([dup])
+                        if not st.session_state.cases_df.empty:
+                            st.session_state.cases_df = pd.concat(
+                                [st.session_state.cases_df, new_df],
+                                ignore_index=True
+                            )
+                        else:
+                            st.session_state.cases_df = new_df
+                        st.session_state.pending_duplicates.pop(idx)
+                        st.rerun()
+                with col2:
+                    if st.button(f"❌ Verwerfen", key=f"skip_dup_{idx}"):
+                        st.session_state.pending_duplicates.pop(idx)
+                        st.rerun()
+
+        if st.button("🗑️ Alle Duplikate verwerfen"):
+            st.session_state.pending_duplicates = []
+            st.rerun()
 
     # Wenn keine Fälle vorhanden
     if st.session_state.cases_df.empty:
