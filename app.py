@@ -12,7 +12,7 @@ Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 # =============================================================================
 # VERSION
 # =============================================================================
-APP_VERSION = "25.12.11-09:30"
+APP_VERSION = "25.12.11-10:15"
 
 import streamlit as st
 import pandas as pd
@@ -363,16 +363,8 @@ def list_google_drive_folder(folder_id: str) -> List[Dict[str, str]]:
         files = []
 
         # Suche nach Datei-Links im Format /file/d/FILE_ID
-        import re
         file_pattern = r'/file/d/([a-zA-Z0-9_-]+)'
         file_ids = set(re.findall(file_pattern, content))
-
-        # Auch nach Dateinamen suchen
-        name_pattern = r'aria-label="([^"]+\.pdf)"'
-        file_names = re.findall(name_pattern, content, re.IGNORECASE)
-
-        # Alternative: Suche nach flip-entry divs
-        entry_pattern = r'data-id="([^"]+)"[^>]*>.*?<div class="flip-entry-title">([^<]+)</div>'
 
         for file_id in file_ids:
             files.append({
@@ -417,7 +409,6 @@ def get_google_drive_folder_files_via_webpage(folder_id: str) -> List[Dict[str, 
         response = requests.get(url, headers=headers, timeout=30)
 
         if response.status_code == 200:
-            import re
             # Suche nach Datei-IDs und Namen
             # Google Drive speichert Daten in JavaScript-Objekten
             content = response.text
