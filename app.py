@@ -12,7 +12,7 @@ Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 # =============================================================================
 # VERSION
 # =============================================================================
-APP_VERSION = "25.12.11-10:15"
+APP_VERSION = "25.12.11-10:45"
 
 import streamlit as st
 import pandas as pd
@@ -1796,38 +1796,16 @@ def main():
 
                                         total_progress.progress((file_idx + 1) / len(folder_files))
 
-                                    # Alle Fälle zusammenführen und DIREKT in Session State speichern
+                                    # Alle Fälle zu all_cases hinzufügen (normaler Ablauf)
                                     if all_folder_cases:
                                         total_count = sum(len(df) for df in all_folder_cases)
-
-                                        # Fälle zusammenführen
-                                        new_combined = pd.concat(all_folder_cases, ignore_index=True)
-
-                                        # Duplikat-Prüfung
-                                        non_duplicates, duplicates = check_duplicates(new_combined, st.session_state.cases_df)
-
-                                        # Duplikate zur manuellen Freigabe speichern
-                                        if not duplicates.empty:
-                                            st.session_state.pending_duplicates.extend(duplicates.to_dict('records'))
-
-                                        # Nicht-doppelte Fälle direkt in Session State speichern
-                                        if not non_duplicates.empty:
-                                            if not st.session_state.cases_df.empty:
-                                                st.session_state.cases_df = pd.concat(
-                                                    [st.session_state.cases_df, non_duplicates],
-                                                    ignore_index=True
-                                                )
-                                            else:
-                                                st.session_state.cases_df = non_duplicates
+                                        all_cases.extend(all_folder_cases)
 
                                         # Ordner-Cache leeren
                                         st.session_state.folder_files = []
 
                                         st.success(f"✅ **Ordner-Verarbeitung abgeschlossen!** "
                                                  f"Insgesamt {total_count} Fälle aus {len(all_folder_cases)} Dateien extrahiert.")
-
-                                        # Seite neu laden um Auswertung anzuzeigen
-                                        st.rerun()
                                     else:
                                         st.warning("⚠️ Keine Fälle in den Dateien gefunden.")
 
@@ -1888,29 +1866,16 @@ def main():
                                                 if total_cases:
                                                     df = cases_list_to_dataframe(total_cases)
                                                     df = normalize_case_df(df, fachgebiet)
+                                                    all_cases.append(df)
                                                     st.session_state.last_processed_file = f"Cloud-Dokument ({provider})"
-
-                                                    # Duplikat-Prüfung
-                                                    non_duplicates, duplicates = check_duplicates(df, st.session_state.cases_df)
-
-                                                    # Duplikate zur manuellen Freigabe speichern
-                                                    if not duplicates.empty:
-                                                        st.session_state.pending_duplicates.extend(duplicates.to_dict('records'))
-
-                                                    # Nicht-doppelte Fälle direkt in Session State speichern
-                                                    if not non_duplicates.empty:
-                                                        if not st.session_state.cases_df.empty:
-                                                            st.session_state.cases_df = pd.concat(
-                                                                [st.session_state.cases_df, non_duplicates],
-                                                                ignore_index=True
-                                                            )
-                                                        else:
-                                                            st.session_state.cases_df = non_duplicates
-
                                                     st.success(f"✓ **{len(total_cases)} Fälle** aus Cloud-Dokument extrahiert!")
 
-                                                    # Seite neu laden um Auswertung anzuzeigen
-                                                    st.rerun()
+                                                    with st.expander("Erkannte Fälle anzeigen"):
+                                                        st.dataframe(
+                                                            df[["kurzrubrum", "sachverhalt", "verfahrenstyp", "bereich_nr"]],
+                                                            use_container_width=True,
+                                                            hide_index=True
+                                                        )
                                                 else:
                                                     st.warning("⚠️ Keine Fälle im Dokument erkannt")
 
