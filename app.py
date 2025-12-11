@@ -12,7 +12,7 @@ Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 # =============================================================================
 # VERSION
 # =============================================================================
-APP_VERSION = "25.12.11-15:27"
+APP_VERSION = "25.12.11-15:38"
 
 import streamlit as st
 import pandas as pd
@@ -1647,10 +1647,31 @@ def main():
 
                                 progress_bar.progress((i + 1) / len(files_to_process))
 
-                            # Nach erfolgreicher Analyse: Upload-Bereich zurücksetzen
+                            # Nach erfolgreicher Analyse: Fälle speichern und Upload-Bereich zurücksetzen
                             if all_cases:
+                                # Fälle zusammenführen
+                                new_combined = pd.concat(all_cases, ignore_index=True)
+                                total_count = len(new_combined)
+
+                                # Duplikat-Prüfung
+                                non_duplicates, duplicates = check_duplicates(new_combined, st.session_state.cases_df)
+
+                                # Fälle in Session State speichern
+                                if not non_duplicates.empty:
+                                    if not st.session_state.cases_df.empty:
+                                        st.session_state.cases_df = pd.concat(
+                                            [st.session_state.cases_df, non_duplicates],
+                                            ignore_index=True
+                                        )
+                                    else:
+                                        st.session_state.cases_df = non_duplicates
+
+                                # Status-Nachricht
+                                if not duplicates.empty:
+                                    st.info(f"ℹ️ {len(duplicates)} Duplikate wurden übersprungen.")
+
                                 st.session_state.upload_key += 1
-                                st.success("✅ Analyse abgeschlossen! Upload-Bereich wurde geleert.")
+                                st.success(f"✅ Analyse abgeschlossen! {len(non_duplicates)} neue Fälle gespeichert.")
                                 st.rerun()
 
     # Tab 2: Cloud-Link Upload (Google Drive, Dropbox, iCloud)
