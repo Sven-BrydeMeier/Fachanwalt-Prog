@@ -12,7 +12,7 @@ Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 # =============================================================================
 # VERSION
 # =============================================================================
-APP_VERSION = "25.12.10-20:45"
+APP_VERSION = "25.12.11-09:30"
 
 import streamlit as st
 import pandas as pd
