@@ -12,7 +12,7 @@ Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 # =============================================================================
 # VERSION
 # =============================================================================
-APP_VERSION = "25.12.11-15:38"
+APP_VERSION = "25.12.13-23:32"
 
 import streamlit as st
 import pandas as pd
@@ -53,6 +53,27 @@ try:
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
+
+# OCR-Integration für gescannte PDFs
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
+# PDF-Report Generation
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
 
 # =============================================================================
 # KONFIGURATION - FAO-Mindestanforderungen (§ 5 FAO, Stand 01.06.2022)
@@ -230,15 +251,55 @@ TEMPLATE_COLUMNS = [
 # PDF-VERARBEITUNG
 # =============================================================================
 
-def extract_text_from_pdf(file) -> str:
-    """Extrahiert Text aus einer PDF-Datei."""
+def extract_text_from_pdf(file, use_ocr: bool = True) -> Tuple[str, str]:
+    """
+    Extrahiert Text aus einer PDF-Datei.
+    Versucht zuerst normale Textextraktion, dann OCR falls wenig Text gefunden.
+
+    Returns:
+        Tuple[str, str]: (extrahierter_text, methode: 'text' oder 'ocr')
+    """
     if not PDF_AVAILABLE:
         raise ImportError("PyPDF2 ist nicht installiert. Bitte führen Sie 'pip install pypdf2' aus.")
 
+    # Zuerst normale Textextraktion versuchen
+    file.seek(0)
     reader = PdfReader(file)
     text = ""
     for page in reader.pages:
-        text += page.extract_text() + "\n"
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + "\n"
+
+    # Wenn genug Text gefunden wurde, zurückgeben
+    if len(text.strip()) >= 100:
+        return text, "text"
+
+    # OCR versuchen, wenn wenig Text und OCR verfügbar
+    if use_ocr and OCR_AVAILABLE and len(text.strip()) < 100:
+        try:
+            file.seek(0)
+            pdf_bytes = file.read()
+            images = convert_from_bytes(pdf_bytes, dpi=200)
+
+            ocr_text = ""
+            for i, image in enumerate(images):
+                # Tesseract mit deutscher Sprache
+                page_text = pytesseract.image_to_string(image, lang='deu')
+                ocr_text += page_text + "\n"
+
+            if len(ocr_text.strip()) > len(text.strip()):
+                return ocr_text, "ocr"
+        except Exception as e:
+            # OCR fehlgeschlagen, ursprünglichen Text zurückgeben
+            pass
+
+    return text, "text"
+
+
+def extract_text_from_pdf_simple(file) -> str:
+    """Legacy-Funktion für Rückwärtskompatibilität."""
+    text, _ = extract_text_from_pdf(file, use_ocr=True)
     return text
 
 
@@ -1363,6 +1424,339 @@ def check_duplicates(new_cases: pd.DataFrame, existing_cases: pd.DataFrame) -> T
 
 
 # =============================================================================
+# PLAUSIBILITÄTSPRÜFUNG
+# =============================================================================
+
+def check_case_plausibility(case: Dict) -> List[Dict]:
+    """
+    Prüft einen Fall auf Plausibilität und gibt Warnungen zurück.
+
+    Returns:
+        List[Dict]: Liste von Warnungen mit 'typ', 'feld', 'meldung'
+    """
+    warnings = []
+
+    # Sachverhalt-Prüfung (4-6 Sätze gefordert)
+    sachverhalt = case.get("sachverhalt", "")
+    if sachverhalt:
+        # Sätze zählen (einfache Heuristik)
+        sentences = len([s for s in sachverhalt.replace("!", ".").replace("?", ".").split(".") if s.strip()])
+        if sentences < 4:
+            warnings.append({
+                "typ": "warnung",
+                "feld": "sachverhalt",
+                "meldung": f"Nur {sentences} Sätze - FAO verlangt 4-6 Sätze"
+            })
+        elif sentences > 8:
+            warnings.append({
+                "typ": "hinweis",
+                "feld": "sachverhalt",
+                "meldung": f"{sentences} Sätze - evtl. kürzen auf 4-6 Sätze"
+            })
+    else:
+        warnings.append({
+            "typ": "fehler",
+            "feld": "sachverhalt",
+            "meldung": "Sachverhalt fehlt - Pflichtfeld!"
+        })
+
+    # Pflichtfelder prüfen
+    pflichtfelder = {
+        "kurzrubrum": "Kurzrubrum",
+        "verfahrenstyp": "Verfahrenstyp",
+        "bereich_nr": "Bereich-Nr"
+    }
+
+    for feld, bezeichnung in pflichtfelder.items():
+        wert = case.get(feld, "")
+        if not wert or str(wert).strip() == "":
+            warnings.append({
+                "typ": "fehler",
+                "feld": feld,
+                "meldung": f"{bezeichnung} fehlt - Pflichtfeld!"
+            })
+
+    # Aktenzeichen-Prüfung
+    kanzlei_az = case.get("kanzlei_az", "")
+    if not kanzlei_az or str(kanzlei_az).strip() == "":
+        warnings.append({
+            "typ": "warnung",
+            "feld": "kanzlei_az",
+            "meldung": "Kanzlei-AZ fehlt - empfohlen für Zuordnung"
+        })
+
+    # Zeitraum-Prüfung
+    zeitraum_von = case.get("zeitraum_von", "")
+    zeitraum_bis = case.get("zeitraum_bis", "")
+    if not zeitraum_von and not zeitraum_bis:
+        warnings.append({
+            "typ": "hinweis",
+            "feld": "zeitraum",
+            "meldung": "Kein Zeitraum angegeben"
+        })
+
+    # Gerichtsaktenzeichen bei gerichtlichen Verfahren
+    verfahrenstyp = case.get("verfahrenstyp", "").lower()
+    if verfahrenstyp in ["gerichtlich", "rechtsfoermlich"]:
+        gericht_az = case.get("gericht_az", "")
+        if not gericht_az or str(gericht_az).strip() == "":
+            warnings.append({
+                "typ": "warnung",
+                "feld": "gericht_az",
+                "meldung": "Gerichts-AZ fehlt bei gerichtlichem Verfahren"
+            })
+
+    return warnings
+
+
+def check_all_cases_plausibility(df: pd.DataFrame) -> Dict:
+    """
+    Prüft alle Fälle auf Plausibilität.
+
+    Returns:
+        Dict mit 'fehler', 'warnungen', 'hinweise' und 'details'
+    """
+    result = {
+        "fehler": 0,
+        "warnungen": 0,
+        "hinweise": 0,
+        "details": []  # Liste von (index, fall_info, warnings)
+    }
+
+    if df.empty:
+        return result
+
+    for idx, row in df.iterrows():
+        case = row.to_dict()
+        warnings = check_case_plausibility(case)
+
+        if warnings:
+            fall_info = f"{case.get('kanzlei_az', 'Unbekannt')} - {case.get('kurzrubrum', '')}"
+            result["details"].append((idx, fall_info, warnings))
+
+            for w in warnings:
+                if w["typ"] == "fehler":
+                    result["fehler"] += 1
+                elif w["typ"] == "warnung":
+                    result["warnungen"] += 1
+                else:
+                    result["hinweise"] += 1
+
+    return result
+
+
+# =============================================================================
+# SESSION SPEICHERN/LADEN
+# =============================================================================
+
+def save_session_to_json(cases_df: pd.DataFrame, fachgebiet: str,
+                         unprocessed_files: List, unrecognized_texts: List,
+                         upload_history: List) -> str:
+    """
+    Speichert die aktuelle Session als JSON-String.
+    """
+    session_data = {
+        "version": APP_VERSION,
+        "timestamp": datetime.now().isoformat(),
+        "fachgebiet": fachgebiet,
+        "cases": cases_df.to_dict(orient="records") if not cases_df.empty else [],
+        "unprocessed_files": unprocessed_files,
+        "unrecognized_texts": unrecognized_texts,
+        "upload_history": upload_history
+    }
+    return json.dumps(session_data, ensure_ascii=False, indent=2, default=str)
+
+
+def load_session_from_json(json_str: str) -> Dict:
+    """
+    Lädt eine Session aus einem JSON-String.
+
+    Returns:
+        Dict mit 'cases_df', 'fachgebiet', 'unprocessed_files', etc.
+    """
+    try:
+        data = json.loads(json_str)
+
+        cases_df = pd.DataFrame(data.get("cases", []))
+
+        return {
+            "success": True,
+            "cases_df": cases_df,
+            "fachgebiet": data.get("fachgebiet", "Erbrecht"),
+            "unprocessed_files": data.get("unprocessed_files", []),
+            "unrecognized_texts": data.get("unrecognized_texts", []),
+            "upload_history": data.get("upload_history", []),
+            "timestamp": data.get("timestamp", ""),
+            "version": data.get("version", "")
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+# =============================================================================
+# PDF-REPORT GENERIERUNG
+# =============================================================================
+
+def create_pdf_report(fl1_df: pd.DataFrame, fl2_df: pd.DataFrame,
+                      summary: Dict, fachgebiet: str) -> bytes:
+    """
+    Erstellt einen PDF-Report der Fallliste.
+    """
+    if not REPORTLAB_AVAILABLE:
+        raise ImportError("ReportLab ist nicht installiert. Bitte 'pip install reportlab' ausführen.")
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                           leftMargin=1.5*cm, rightMargin=1.5*cm,
+                           topMargin=2*cm, bottomMargin=2*cm)
+
+    styles = getSampleStyleSheet()
+    story = []
+
+    # Titel-Styles
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=18,
+        spaceAfter=30
+    )
+
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontSize=14,
+        spaceBefore=20,
+        spaceAfter=10
+    )
+
+    normal_style = ParagraphStyle(
+        'CustomNormal',
+        parent=styles['Normal'],
+        fontSize=10,
+        spaceAfter=6
+    )
+
+    # Titelseite
+    story.append(Paragraph(f"Fallliste {fachgebiet}", title_style))
+    story.append(Paragraph(f"Erstellt am: {datetime.now().strftime('%d.%m.%Y %H:%M')}", normal_style))
+    story.append(Spacer(1, 20))
+
+    # Zusammenfassung
+    story.append(Paragraph("Übersicht", heading_style))
+    summary_data = [
+        ["Kriterium", "Wert"],
+        ["Fälle gesamt", str(summary.get("gesamt", 0))],
+        ["Gerichtliche Verfahren", str(summary.get("gerichtlich", 0))],
+        ["Außergerichtliche Verfahren", str(summary.get("aussergerichtlich", 0))],
+        ["Rechtsförmliche Verfahren", str(summary.get("rechtsfoermlich", 0))],
+    ]
+
+    summary_table = Table(summary_data, colWidths=[10*cm, 5*cm])
+    summary_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e3a5f')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f0f0')]),
+    ]))
+    story.append(summary_table)
+    story.append(Spacer(1, 20))
+
+    # FAO-Check
+    story.append(Paragraph("FAO-Konformitätscheck", heading_style))
+    check_data = [["Kriterium", "Ist", "Soll", "Status"]]
+    for check in summary.get("checks", []):
+        kriterium, ist, soll, status = check
+        status_text = {"erfuellt": "✓ Erfüllt", "knapp": "⚠ Knapp", "nicht_erfuellt": "✗ Nicht erfüllt"}.get(status, status)
+        check_data.append([kriterium, str(ist), str(soll), status_text])
+
+    check_table = Table(check_data, colWidths=[7*cm, 3*cm, 3*cm, 4*cm])
+    check_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e3a5f')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('ALIGN', (1, 0), (2, -1), 'CENTER'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+    ]))
+    story.append(check_table)
+
+    # Fallliste 1 (gekürzt für Übersicht)
+    if not fl1_df.empty:
+        story.append(PageBreak())
+        story.append(Paragraph(f"Fallliste 1 - Gerichtliche/Rechtsförmliche Verfahren ({len(fl1_df)} Fälle)", heading_style))
+
+        fl1_data = [["Nr.", "Kurzrubrum", "Bereich", "Typ"]]
+        for _, row in fl1_df.head(50).iterrows():  # Max 50 für Übersicht
+            fl1_data.append([
+                str(row.get("FL1_Nr", "")),
+                str(row.get("kurzrubrum", ""))[:40],
+                str(row.get("bereich_nr", "")),
+                str(row.get("verfahrenstyp", ""))[:15]
+            ])
+
+        if len(fl1_df) > 50:
+            fl1_data.append(["...", f"(weitere {len(fl1_df) - 50} Fälle)", "", ""])
+
+        fl1_table = Table(fl1_data, colWidths=[1.5*cm, 10*cm, 2*cm, 3*cm])
+        fl1_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2e7d32')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ]))
+        story.append(fl1_table)
+
+    # Fallliste 2 (gekürzt)
+    if not fl2_df.empty:
+        story.append(Spacer(1, 20))
+        story.append(Paragraph(f"Fallliste 2 - Außergerichtliche Verfahren ({len(fl2_df)} Fälle)", heading_style))
+
+        fl2_data = [["Nr.", "Kurzrubrum", "Bereich"]]
+        for _, row in fl2_df.head(50).iterrows():
+            fl2_data.append([
+                str(row.get("FL2_Nr", "")),
+                str(row.get("kurzrubrum", ""))[:50],
+                str(row.get("bereich_nr", ""))
+            ])
+
+        if len(fl2_df) > 50:
+            fl2_data.append(["...", f"(weitere {len(fl2_df) - 50} Fälle)", ""])
+
+        fl2_table = Table(fl2_data, colWidths=[1.5*cm, 12*cm, 2*cm])
+        fl2_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1565c0')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ]))
+        story.append(fl2_table)
+
+    # Footer-Info
+    story.append(Spacer(1, 30))
+    story.append(Paragraph(
+        f"Generiert mit FAO-Falllisten-Generator v{APP_VERSION}",
+        ParagraphStyle('Footer', parent=styles['Normal'], fontSize=8, textColor=colors.grey)
+    ))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# =============================================================================
 # STREAMLIT APP
 # =============================================================================
 
@@ -1404,6 +1798,12 @@ def main():
         st.session_state.unrecognized_texts = []  # Texte ohne erkannte Fälle
     if "last_processed_file" not in st.session_state:
         st.session_state.last_processed_file = None  # Zuletzt verarbeitete Datei
+    if "upload_history" not in st.session_state:
+        st.session_state.upload_history = []  # Historie der hochgeladenen Dateien
+    if "editing_case_index" not in st.session_state:
+        st.session_state.editing_case_index = None  # Index des aktuell bearbeiteten Falls
+    if "selected_fachgebiet" not in st.session_state:
+        st.session_state.selected_fachgebiet = None  # Für Fachgebiet-Wechsel
 
     # Sidebar
     with st.sidebar:
@@ -1477,6 +1877,60 @@ def main():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             help="Zeigt das Format, das ChatGPT automatisch aus Ihren PDFs erstellt"
         )
+
+        # Session speichern/laden
+        st.markdown("---")
+        st.subheader("💾 Session verwalten")
+
+        # Session speichern
+        if not st.session_state.cases_df.empty:
+            session_json = save_session_to_json(
+                st.session_state.cases_df,
+                fachgebiet,
+                st.session_state.unprocessed_files,
+                st.session_state.unrecognized_texts,
+                st.session_state.upload_history
+            )
+            st.download_button(
+                label="💾 Session speichern",
+                data=session_json,
+                file_name=f"fallliste_session_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json",
+                help="Speichern Sie Ihre Arbeit, um später fortzufahren"
+            )
+
+        # Session laden
+        uploaded_session = st.file_uploader(
+            "Session laden",
+            type=["json"],
+            help="Laden Sie eine gespeicherte Session",
+            key="session_upload"
+        )
+
+        if uploaded_session:
+            if st.button("📂 Session laden", type="secondary"):
+                session_data = load_session_from_json(uploaded_session.read().decode("utf-8"))
+                if session_data["success"]:
+                    st.session_state.cases_df = session_data["cases_df"]
+                    st.session_state.unprocessed_files = session_data["unprocessed_files"]
+                    st.session_state.unrecognized_texts = session_data["unrecognized_texts"]
+                    st.session_state.upload_history = session_data["upload_history"]
+                    st.success(f"✓ Session geladen ({len(session_data['cases_df'])} Fälle)")
+                    st.caption(f"Gespeichert am: {session_data['timestamp'][:16] if session_data['timestamp'] else 'Unbekannt'}")
+                    st.rerun()
+                else:
+                    st.error(f"Fehler: {session_data['error']}")
+
+        # Upload-Historie anzeigen
+        if st.session_state.upload_history:
+            st.markdown("---")
+            st.subheader("📜 Upload-Historie")
+            with st.expander(f"{len(st.session_state.upload_history)} Dateien verarbeitet"):
+                for entry in st.session_state.upload_history[-10:]:  # Letzte 10
+                    st.caption(f"• {entry.get('datei', 'Unbekannt')} ({entry.get('zeitpunkt', '')})")
+            if st.button("🗑️ Historie löschen", key="clear_history"):
+                st.session_state.upload_history = []
+                st.rerun()
 
     # =========================================================================
     # HAUPTBEREICH
@@ -1591,7 +2045,8 @@ def main():
                             for i, pdf_file in enumerate(files_to_process):
                                 with st.spinner(f"Analysiere {pdf_file.name}..."):
                                     try:
-                                        pdf_text = extract_text_from_pdf(pdf_file)
+                                        # OCR-Unterstützung: Gibt (text, methode) zurück
+                                        pdf_text, extraction_method = extract_text_from_pdf(pdf_file, use_ocr=OCR_AVAILABLE)
 
                                         if len(pdf_text.strip()) < 50:
                                             st.warning(f"⚠️ {pdf_file.name}: Wenig Text gefunden. Gescanntes PDF?")
@@ -1603,6 +2058,10 @@ def main():
                                                 "Zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
                                             })
                                             continue
+
+                                        # OCR-Hinweis
+                                        if extraction_method == "ocr":
+                                            st.info(f"🔍 {pdf_file.name}: Text via OCR extrahiert (gescanntes PDF)")
 
                                         cases = analyze_cases_with_gpt(
                                             client,
@@ -1616,6 +2075,15 @@ def main():
                                             df = normalize_case_df(df, fachgebiet)
                                             all_cases.append(df)
                                             st.session_state.last_processed_file = pdf_file.name
+
+                                            # Upload-Historie aktualisieren
+                                            st.session_state.upload_history.append({
+                                                "datei": pdf_file.name,
+                                                "faelle": len(cases),
+                                                "methode": extraction_method,
+                                                "zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
+                                            })
+
                                             st.success(f"✓ {pdf_file.name}: **{len(cases)} Fälle** erkannt")
 
                                             with st.expander(f"Details: {pdf_file.name}"):
@@ -1756,9 +2224,9 @@ def main():
                                             buffer = download_from_google_drive(file_id)
 
                                             if buffer:
-                                                # Text extrahieren
+                                                # Text extrahieren (mit OCR-Unterstützung)
                                                 try:
-                                                    pdf_text = extract_text_from_pdf(buffer)
+                                                    pdf_text, extraction_method = extract_text_from_pdf(buffer, use_ocr=OCR_AVAILABLE)
 
                                                     if len(pdf_text.strip()) < 50:
                                                         st.warning(f"⚠️ {file_name}: Wenig Text gefunden")
@@ -1770,6 +2238,10 @@ def main():
                                                             "Zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
                                                         })
                                                     else:
+                                                        # OCR-Hinweis
+                                                        if extraction_method == "ocr":
+                                                            st.info(f"🔍 {file_name}: Text via OCR extrahiert")
+
                                                         # GPT-Analyse
                                                         cases = analyze_cases_with_gpt(client, pdf_text, fachgebiet, model=gpt_model)
 
@@ -1778,6 +2250,16 @@ def main():
                                                             df = normalize_case_df(df, fachgebiet)
                                                             all_folder_cases.append(df)
                                                             st.session_state.last_processed_file = file_name
+
+                                                            # Upload-Historie aktualisieren
+                                                            st.session_state.upload_history.append({
+                                                                "datei": file_name,
+                                                                "faelle": len(cases),
+                                                                "methode": extraction_method,
+                                                                "quelle": "Google Drive Ordner",
+                                                                "zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
+                                                            })
+
                                                             st.success(f"✓ {len(cases)} Fälle aus {file_name}")
                                                         else:
                                                             st.warning(f"⚠️ {file_name}: Keine Fälle erkannt")
@@ -1862,10 +2344,13 @@ def main():
                                     progress_placeholder.empty()
                                     st.success("✓ Download abgeschlossen!")
 
-                                    # Prüfen ob PDF
+                                    # Prüfen ob PDF (mit OCR-Unterstützung)
                                     try:
                                         with st.spinner("Extrahiere Text aus PDF..."):
-                                            pdf_text = extract_text_from_pdf(buffer)
+                                            pdf_text, extraction_method = extract_text_from_pdf(buffer, use_ocr=OCR_AVAILABLE)
+
+                                        if extraction_method == "ocr":
+                                            st.info("🔍 Text via OCR extrahiert (gescanntes PDF)")
 
                                         if len(pdf_text.strip()) < 50:
                                             st.warning("⚠️ Wenig Text gefunden. Gescanntes PDF?")
@@ -1905,6 +2390,15 @@ def main():
                                                     df = cases_list_to_dataframe(total_cases)
                                                     df = normalize_case_df(df, fachgebiet)
                                                     st.session_state.last_processed_file = f"Cloud-Dokument ({provider})"
+
+                                                    # Upload-Historie aktualisieren
+                                                    st.session_state.upload_history.append({
+                                                        "datei": f"Cloud-Dokument ({provider})",
+                                                        "faelle": len(total_cases),
+                                                        "methode": extraction_method,
+                                                        "quelle": provider,
+                                                        "zeitpunkt": datetime.now().strftime("%d.%m.%Y %H:%M")
+                                                    })
 
                                                     # Duplikat-Prüfung
                                                     non_duplicates, duplicates = check_duplicates(df, st.session_state.cases_df)
@@ -2230,6 +2724,129 @@ Im Januar 2024 beauftragte mich Mandant A mit der Durchsetzung seiner Erbansprü
             st.info("Keine außergerichtlichen Verfahren vorhanden.")
 
     # =========================================================================
+    # PLAUSIBILITÄTSPRÜFUNG
+    # =========================================================================
+
+    st.markdown("---")
+    st.header("🔍 Plausibilitätsprüfung")
+
+    plausibility_result = check_all_cases_plausibility(filtered_df)
+
+    # Zusammenfassung
+    plaus_col1, plaus_col2, plaus_col3 = st.columns(3)
+
+    with plaus_col1:
+        if plausibility_result["fehler"] > 0:
+            st.error(f"❌ **{plausibility_result['fehler']}** Fehler")
+        else:
+            st.success("✓ Keine Fehler")
+
+    with plaus_col2:
+        if plausibility_result["warnungen"] > 0:
+            st.warning(f"⚠️ **{plausibility_result['warnungen']}** Warnungen")
+        else:
+            st.success("✓ Keine Warnungen")
+
+    with plaus_col3:
+        if plausibility_result["hinweise"] > 0:
+            st.info(f"ℹ️ **{plausibility_result['hinweise']}** Hinweise")
+        else:
+            st.success("✓ Keine Hinweise")
+
+    # Details anzeigen
+    if plausibility_result["details"]:
+        with st.expander(f"📋 Details zu {len(plausibility_result['details'])} Fällen mit Anmerkungen"):
+            for idx, fall_info, warnings in plausibility_result["details"][:20]:  # Max 20 anzeigen
+                st.markdown(f"**{fall_info}**")
+                for w in warnings:
+                    if w["typ"] == "fehler":
+                        st.markdown(f"  - ❌ {w['meldung']}")
+                    elif w["typ"] == "warnung":
+                        st.markdown(f"  - ⚠️ {w['meldung']}")
+                    else:
+                        st.markdown(f"  - ℹ️ {w['meldung']}")
+                st.markdown("---")
+
+            if len(plausibility_result["details"]) > 20:
+                st.caption(f"... und {len(plausibility_result['details']) - 20} weitere Fälle")
+
+    # =========================================================================
+    # FÄLLE BEARBEITEN
+    # =========================================================================
+
+    st.markdown("---")
+    st.header("✏️ Fälle bearbeiten")
+
+    with st.expander("Fall bearbeiten oder löschen"):
+        if not filtered_df.empty:
+            # Fall zum Bearbeiten auswählen
+            case_options = []
+            for idx, row in filtered_df.iterrows():
+                case_options.append(f"{idx}: {row.get('kanzlei_az', 'Ohne AZ')} - {row.get('kurzrubrum', '')[:30]}")
+
+            selected_case = st.selectbox("Fall auswählen", case_options, key="edit_case_select")
+
+            if selected_case:
+                case_idx = int(selected_case.split(":")[0])
+                case_data = st.session_state.cases_df.loc[case_idx].to_dict()
+
+                # Bearbeitungsformular
+                edit_col1, edit_col2 = st.columns(2)
+
+                with edit_col1:
+                    new_kanzlei_az = st.text_input("Kanzlei-AZ", value=str(case_data.get("kanzlei_az", "")), key="edit_kanzlei_az")
+                    new_kurzrubrum = st.text_input("Kurzrubrum", value=str(case_data.get("kurzrubrum", "")), key="edit_kurzrubrum")
+                    new_gericht_az = st.text_input("Gerichts-AZ", value=str(case_data.get("gericht_az", "")), key="edit_gericht_az")
+
+                with edit_col2:
+                    new_verfahrenstyp = st.selectbox(
+                        "Verfahrenstyp",
+                        ["gerichtlich", "rechtsfoermlich", "aussergerichtlich"],
+                        index=["gerichtlich", "rechtsfoermlich", "aussergerichtlich"].index(
+                            str(case_data.get("verfahrenstyp", "aussergerichtlich")).lower()
+                        ) if str(case_data.get("verfahrenstyp", "")).lower() in ["gerichtlich", "rechtsfoermlich", "aussergerichtlich"] else 2,
+                        key="edit_verfahrenstyp"
+                    )
+                    bereiche_list = list(FAO_CONFIG[fachgebiet].get("bereiche", {}).keys())
+                    current_bereich = case_data.get("bereich_nr", 1)
+                    try:
+                        bereich_index = bereiche_list.index(int(current_bereich)) if current_bereich else 0
+                    except (ValueError, TypeError):
+                        bereich_index = 0
+                    new_bereich_nr = st.selectbox("Bereich-Nr", bereiche_list, index=bereich_index, key="edit_bereich_nr")
+
+                new_sachverhalt = st.text_area(
+                    "Sachverhalt (4-6 Sätze empfohlen)",
+                    value=str(case_data.get("sachverhalt", "")),
+                    height=150,
+                    key="edit_sachverhalt"
+                )
+
+                # Buttons
+                btn_col1, btn_col2, btn_col3 = st.columns(3)
+
+                with btn_col1:
+                    if st.button("💾 Änderungen speichern", type="primary", key="save_edit"):
+                        st.session_state.cases_df.at[case_idx, "kanzlei_az"] = new_kanzlei_az
+                        st.session_state.cases_df.at[case_idx, "kurzrubrum"] = new_kurzrubrum
+                        st.session_state.cases_df.at[case_idx, "gericht_az"] = new_gericht_az
+                        st.session_state.cases_df.at[case_idx, "verfahrenstyp"] = new_verfahrenstyp
+                        st.session_state.cases_df.at[case_idx, "bereich_nr"] = new_bereich_nr
+                        st.session_state.cases_df.at[case_idx, "sachverhalt"] = new_sachverhalt
+                        st.session_state.cases_df.at[case_idx, "bereich_bezeichnung"] = FAO_CONFIG[fachgebiet]["bereiche"].get(new_bereich_nr, "")
+                        st.success("✓ Änderungen gespeichert!")
+                        st.rerun()
+
+                with btn_col2:
+                    if st.button("🗑️ Fall löschen", type="secondary", key="delete_case"):
+                        st.session_state.cases_df = st.session_state.cases_df.drop(case_idx).reset_index(drop=True)
+                        st.success("✓ Fall gelöscht!")
+                        st.rerun()
+
+                with btn_col3:
+                    st.caption(f"Index: {case_idx}")
+
+    # =========================================================================
     # EXPORT - FERTIGE FALLLISTE ZUM EINREICHEN
     # =========================================================================
 
@@ -2252,11 +2869,12 @@ Im Januar 2024 beauftragte mich Mandant A mit der Durchsetzung seiner Erbansprü
     )
     filename = f"Fallliste_{fachgebiet.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
-    col1, col2, col3 = st.columns([2, 1, 1])
+    # Download-Buttons
+    download_col1, download_col2 = st.columns(2)
 
-    with col1:
+    with download_col1:
         st.download_button(
-            label="📥 FALLLISTE HERUNTERLADEN (Excel)",
+            label="📥 EXCEL herunterladen",
             data=excel_bytes,
             file_name=filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2264,12 +2882,41 @@ Im Januar 2024 beauftragte mich Mandant A mit der Durchsetzung seiner Erbansprü
             use_container_width=True
         )
 
-    with col2:
+    with download_col2:
+        # PDF-Report (falls verfügbar)
+        if REPORTLAB_AVAILABLE:
+            try:
+                pdf_bytes = create_pdf_report(fl1, fl2, summary, fachgebiet)
+                pdf_filename = f"Fallliste_{fachgebiet.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.pdf"
+                st.download_button(
+                    label="📄 PDF-Report herunterladen",
+                    data=pdf_bytes,
+                    file_name=pdf_filename,
+                    mime="application/pdf",
+                    type="secondary",
+                    use_container_width=True
+                )
+            except Exception as e:
+                st.warning(f"PDF-Erstellung nicht möglich: {str(e)}")
+        else:
+            st.info("PDF-Export benötigt: `pip install reportlab`")
+
+    # Statistik und Reset
+    stat_col1, stat_col2, stat_col3 = st.columns([1, 1, 1])
+
+    with stat_col1:
         st.metric("Fälle gesamt", summary["gesamt"])
 
-    with col3:
-        if st.button("🗑️ Zurücksetzen", help="Alle Fälle löschen und neu beginnen"):
+    with stat_col2:
+        erfuellt = sum(1 for c in summary["checks"] if c[3] == "erfuellt")
+        st.metric("FAO-Kriterien erfüllt", f"{erfuellt}/{len(summary['checks'])}")
+
+    with stat_col3:
+        if st.button("🗑️ Zurücksetzen", help="Alle Fälle löschen und neu beginnen", use_container_width=True):
             st.session_state.cases_df = pd.DataFrame()
+            st.session_state.upload_history = []
+            st.session_state.unprocessed_files = []
+            st.session_state.unrecognized_texts = []
             st.rerun()
 
 
