@@ -12,7 +12,7 @@ Voraussetzungen: pip install streamlit pandas openpyxl openai pypdf2
 # =============================================================================
 # VERSION
 # =============================================================================
-APP_VERSION = "25.12.13-23:32"
+APP_VERSION = "25.12.13-23:33"
 
 import streamlit as st
 import pandas as pd
@@ -74,6 +74,16 @@ try:
     REPORTLAB_AVAILABLE = True
 except ImportError:
     REPORTLAB_AVAILABLE = False
+
+# Word-Dokument Generation
+try:
+    from docx import Document
+    from docx.shared import Pt, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
 
 # =============================================================================
 # KONFIGURATION - FAO-Mindestanforderungen (§ 5 FAO, Stand 01.06.2022)
@@ -1757,6 +1767,241 @@ def create_pdf_report(fl1_df: pd.DataFrame, fl2_df: pd.DataFrame,
 
 
 # =============================================================================
+# ANTRAGSSCHREIBEN GENERIERUNG
+# =============================================================================
+
+def create_antragsschreiben(
+    antragsteller: Dict,
+    fachgebiet: str,
+    summary: Dict,
+    klausuren: List[Dict],
+    bereich_verteilung: Dict,
+    fl1_count: int,
+    fl2_count: int
+) -> bytes:
+    """
+    Erstellt ein formelles Antragsschreiben als Word-Dokument.
+
+    Args:
+        antragsteller: Dict mit Name, Anschrift, Zulassungsdatum, etc.
+        fachgebiet: Das beantragte Fachgebiet
+        summary: Zusammenfassung der Fallliste
+        klausuren: Liste der bestandenen Klausuren
+        bereich_verteilung: Verteilung der Fälle auf Bereiche
+        fl1_count: Anzahl Fälle in Fallliste 1
+        fl2_count: Anzahl Fälle in Fallliste 2
+
+    Returns:
+        bytes: Word-Dokument als Bytes
+    """
+    if not DOCX_AVAILABLE:
+        raise ImportError("python-docx ist nicht installiert. Bitte 'pip install python-docx' ausführen.")
+
+    doc = Document()
+
+    # Seitenränder
+    for section in doc.sections:
+        section.top_margin = Cm(2.5)
+        section.bottom_margin = Cm(2)
+        section.left_margin = Cm(2.5)
+        section.right_margin = Cm(2)
+
+    # Absender (rechtsbündig)
+    absender = doc.add_paragraph()
+    absender.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    absender_run = absender.add_run(
+        f"{antragsteller.get('name', '[Name]')}\n"
+        f"{antragsteller.get('kanzlei', '[Kanzlei]')}\n"
+        f"{antragsteller.get('strasse', '[Straße]')}\n"
+        f"{antragsteller.get('plz_ort', '[PLZ Ort]')}\n"
+        f"Tel.: {antragsteller.get('telefon', '[Telefon]')}\n"
+        f"E-Mail: {antragsteller.get('email', '[E-Mail]')}"
+    )
+    absender_run.font.size = Pt(10)
+
+    doc.add_paragraph()  # Leerzeile
+
+    # Empfänger
+    empfaenger = doc.add_paragraph()
+    empfaenger_run = empfaenger.add_run(
+        f"{antragsteller.get('kammer_name', 'Rechtsanwaltskammer [Ort]')}\n"
+        f"{antragsteller.get('kammer_strasse', '[Straße]')}\n"
+        f"{antragsteller.get('kammer_plz_ort', '[PLZ Ort]')}"
+    )
+    empfaenger_run.font.size = Pt(11)
+    empfaenger_run.bold = True
+
+    doc.add_paragraph()  # Leerzeile
+
+    # Datum
+    datum = doc.add_paragraph()
+    datum.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    datum_run = datum.add_run(f"{antragsteller.get('ort', '[Ort]')}, den {datetime.now().strftime('%d.%m.%Y')}")
+    datum_run.font.size = Pt(11)
+
+    doc.add_paragraph()  # Leerzeile
+
+    # Betreff
+    betreff = doc.add_paragraph()
+    betreff_run = betreff.add_run(f'Antrag auf Verleihung der Bezeichnung "Fachanwalt für {fachgebiet}"')
+    betreff_run.bold = True
+    betreff_run.font.size = Pt(12)
+
+    doc.add_paragraph()  # Leerzeile
+
+    # Anrede
+    anrede = doc.add_paragraph()
+    anrede.add_run("Sehr geehrte Damen und Herren,").font.size = Pt(11)
+
+    doc.add_paragraph()  # Leerzeile
+
+    # Einleitung
+    config = FAO_CONFIG.get(fachgebiet, {})
+    paragraph_ref = config.get("paragraph", "§ 5 FAO")
+
+    einleitung = doc.add_paragraph()
+    einleitung_text = (
+        f'hiermit beantrage ich die Verleihung der Bezeichnung "Fachanwalt für {fachgebiet}" '
+        f"gemäß {paragraph_ref}.\n\n"
+        f"Ich bin seit dem {antragsteller.get('zulassung_datum', '[Datum]')} zur Rechtsanwaltschaft zugelassen "
+        f"und bei der {antragsteller.get('kammer_name', 'Rechtsanwaltskammer [Ort]')} als Rechtsanwalt/Rechtsanwältin "
+        f"eingetragen."
+    )
+    einleitung.add_run(einleitung_text).font.size = Pt(11)
+
+    # Theoretische Kenntnisse
+    doc.add_paragraph()
+    theo_header = doc.add_paragraph()
+    theo_header.add_run("I. Nachweis der besonderen theoretischen Kenntnisse").bold = True
+
+    theo_text = doc.add_paragraph()
+    lehrgang_info = antragsteller.get('lehrgang_info', '[Lehrgangsbezeichnung]')
+    lehrgang_datum = antragsteller.get('lehrgang_datum', '[Datum]')
+
+    theo_content = (
+        f'Ich habe den Fachanwaltslehrgang "{lehrgang_info}" erfolgreich absolviert. '
+        f"Der Lehrgang wurde am {lehrgang_datum} abgeschlossen.\n\n"
+        f"Folgende Klausuren wurden bestanden:"
+    )
+    theo_text.add_run(theo_content).font.size = Pt(11)
+
+    # Klausurtabelle
+    if klausuren:
+        table = doc.add_table(rows=1, cols=3)
+        table.style = 'Table Grid'
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+        # Header
+        header_cells = table.rows[0].cells
+        header_cells[0].text = "Klausur"
+        header_cells[1].text = "Datum"
+        header_cells[2].text = "Ergebnis"
+
+        for cell in header_cells:
+            cell.paragraphs[0].runs[0].bold = True
+
+        # Klausuren eintragen
+        for klausur in klausuren:
+            row = table.add_row()
+            row.cells[0].text = klausur.get('bezeichnung', '')
+            row.cells[1].text = klausur.get('datum', '')
+            row.cells[2].text = klausur.get('ergebnis', 'bestanden')
+
+    doc.add_paragraph()
+
+    # Praktische Erfahrungen
+    prak_header = doc.add_paragraph()
+    prak_header.add_run("II. Nachweis der besonderen praktischen Erfahrungen").bold = True
+
+    gesamt = summary.get("gesamt", 0)
+    gerichtlich = summary.get("gerichtlich", 0)
+    aussergerichtlich = summary.get("aussergerichtlich", 0)
+    config_gesamt_min = config.get("gesamt_min", 0)
+    config_gerichtlich_min = config.get("gerichtlich_min", 0)
+
+    prak_text = doc.add_paragraph()
+    prak_content = (
+        f"In den letzten drei Jahren vor Antragstellung habe ich insgesamt {gesamt} Fälle "
+        f"aus dem Bereich {fachgebiet} persönlich und weisungsfrei bearbeitet.\n\n"
+        f"Die beigefügten Falllisten weisen nach:\n"
+        f"• Fallliste 1 (gerichtliche/rechtsförmliche Verfahren): {fl1_count} Fälle\n"
+        f"• Fallliste 2 (außergerichtliche Verfahren): {fl2_count} Fälle\n\n"
+        f"Die Anforderungen gemäß {paragraph_ref} (mindestens {config_gesamt_min} Fälle, "
+        f"davon mindestens {config_gerichtlich_min} gerichtliche/rechtsförmliche Verfahren) "
+        f"sind damit erfüllt."
+    )
+    prak_text.add_run(prak_content).font.size = Pt(11)
+
+    # Bereichsverteilung
+    if bereich_verteilung:
+        doc.add_paragraph()
+        bereich_header = doc.add_paragraph()
+        bereich_header.add_run("Verteilung auf die Bereiche:").italic = True
+
+        bereiche_config = config.get("bereiche", {})
+        bereich_table = doc.add_table(rows=1, cols=3)
+        bereich_table.style = 'Table Grid'
+
+        header_cells = bereich_table.rows[0].cells
+        header_cells[0].text = "Nr."
+        header_cells[1].text = "Bereich"
+        header_cells[2].text = "Anzahl"
+
+        for cell in header_cells:
+            cell.paragraphs[0].runs[0].bold = True
+
+        for bereich_nr, count in sorted(bereich_verteilung.items()):
+            bereich_name = bereiche_config.get(bereich_nr, f"Bereich {bereich_nr}")
+            row = bereich_table.add_row()
+            row.cells[0].text = str(bereich_nr)
+            row.cells[1].text = bereich_name
+            row.cells[2].text = str(count)
+
+    doc.add_paragraph()
+
+    # Anlagen
+    anlagen_header = doc.add_paragraph()
+    anlagen_header.add_run("III. Anlagen").bold = True
+
+    anlagen_text = doc.add_paragraph()
+    anlagen_content = (
+        "Dem Antrag füge ich bei:\n\n"
+        "1. Fallliste 1 – Gerichtliche und rechtsförmliche Verfahren (Excel)\n"
+        "2. Fallliste 2 – Außergerichtliche Verfahren (Excel)\n"
+        "3. Zusammenfassende Übersicht mit FAO-Konformitätsprüfung\n"
+        "4. Zeugnis über den erfolgreichen Abschluss des Fachanwaltslehrgangs\n"
+        "5. Klausurzeugnisse (soweit separat ausgestellt)\n"
+        "6. Nachweis der Berufshaftpflichtversicherung\n"
+        "7. Erklärung gemäß § 7 FAO (Eigenverantwortliche Bearbeitung)"
+    )
+    anlagen_text.add_run(anlagen_content).font.size = Pt(11)
+
+    doc.add_paragraph()
+
+    # Schluss
+    schluss = doc.add_paragraph()
+    schluss_content = (
+        "Für Rückfragen stehe ich Ihnen jederzeit gerne zur Verfügung.\n\n"
+        "Mit freundlichen kollegialen Grüßen"
+    )
+    schluss.add_run(schluss_content).font.size = Pt(11)
+
+    doc.add_paragraph()
+    doc.add_paragraph()
+
+    # Unterschrift
+    unterschrift = doc.add_paragraph()
+    unterschrift.add_run(antragsteller.get('name', '[Name]')).font.size = Pt(11)
+    unterschrift.add_run("\nRechtsanwalt/Rechtsanwältin").font.size = Pt(10)
+
+    # Dokument speichern
+    buffer = BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# =============================================================================
 # STREAMLIT APP
 # =============================================================================
 
@@ -1804,6 +2049,26 @@ def main():
         st.session_state.editing_case_index = None  # Index des aktuell bearbeiteten Falls
     if "selected_fachgebiet" not in st.session_state:
         st.session_state.selected_fachgebiet = None  # Für Fachgebiet-Wechsel
+
+    # Antragsteller-Daten für Antragsschreiben
+    if "antragsteller" not in st.session_state:
+        st.session_state.antragsteller = {
+            "name": "",
+            "kanzlei": "",
+            "strasse": "",
+            "plz_ort": "",
+            "telefon": "",
+            "email": "",
+            "ort": "",
+            "zulassung_datum": "",
+            "kammer_name": "",
+            "kammer_strasse": "",
+            "kammer_plz_ort": "",
+            "lehrgang_info": "",
+            "lehrgang_datum": ""
+        }
+    if "klausuren" not in st.session_state:
+        st.session_state.klausuren = []  # Liste der bestandenen Klausuren
 
     # Sidebar
     with st.sidebar:
@@ -2918,6 +3183,220 @@ Im Januar 2024 beauftragte mich Mandant A mit der Durchsetzung seiner Erbansprü
             st.session_state.unprocessed_files = []
             st.session_state.unrecognized_texts = []
             st.rerun()
+
+    # =========================================================================
+    # ANTRAGSSCHREIBEN GENERIEREN
+    # =========================================================================
+
+    st.markdown("---")
+    st.header("📝 Antragsschreiben erstellen")
+
+    st.markdown("""
+    Erstellen Sie ein formelles **Antragsschreiben an die Rechtsanwaltskammer** mit:
+    - Bezugnahme auf Ihre Falllisten und deren Verteilung
+    - Auflistung der bestandenen Klausuren
+    - Alle erforderlichen Anlagen
+    """)
+
+    with st.expander("📋 Antragsteller-Daten eingeben", expanded=False):
+        st.subheader("Ihre Angaben")
+
+        antrag_col1, antrag_col2 = st.columns(2)
+
+        with antrag_col1:
+            st.markdown("**Persönliche Daten:**")
+            st.session_state.antragsteller["name"] = st.text_input(
+                "Name (mit Titel)",
+                value=st.session_state.antragsteller.get("name", ""),
+                placeholder="Rechtsanwalt Max Mustermann",
+                key="antrag_name"
+            )
+            st.session_state.antragsteller["kanzlei"] = st.text_input(
+                "Kanzlei",
+                value=st.session_state.antragsteller.get("kanzlei", ""),
+                placeholder="Mustermann & Partner Rechtsanwälte",
+                key="antrag_kanzlei"
+            )
+            st.session_state.antragsteller["strasse"] = st.text_input(
+                "Straße",
+                value=st.session_state.antragsteller.get("strasse", ""),
+                placeholder="Musterstraße 123",
+                key="antrag_strasse"
+            )
+            st.session_state.antragsteller["plz_ort"] = st.text_input(
+                "PLZ Ort",
+                value=st.session_state.antragsteller.get("plz_ort", ""),
+                placeholder="12345 Musterstadt",
+                key="antrag_plz_ort"
+            )
+            st.session_state.antragsteller["telefon"] = st.text_input(
+                "Telefon",
+                value=st.session_state.antragsteller.get("telefon", ""),
+                placeholder="030 123456789",
+                key="antrag_telefon"
+            )
+            st.session_state.antragsteller["email"] = st.text_input(
+                "E-Mail",
+                value=st.session_state.antragsteller.get("email", ""),
+                placeholder="ra.mustermann@kanzlei.de",
+                key="antrag_email"
+            )
+            st.session_state.antragsteller["ort"] = st.text_input(
+                "Ort (für Datum)",
+                value=st.session_state.antragsteller.get("ort", ""),
+                placeholder="Berlin",
+                key="antrag_ort"
+            )
+            st.session_state.antragsteller["zulassung_datum"] = st.text_input(
+                "Zulassungsdatum",
+                value=st.session_state.antragsteller.get("zulassung_datum", ""),
+                placeholder="01.01.2020",
+                key="antrag_zulassung"
+            )
+
+        with antrag_col2:
+            st.markdown("**Rechtsanwaltskammer:**")
+            st.session_state.antragsteller["kammer_name"] = st.text_input(
+                "Name der Kammer",
+                value=st.session_state.antragsteller.get("kammer_name", ""),
+                placeholder="Rechtsanwaltskammer Berlin",
+                key="antrag_kammer_name"
+            )
+            st.session_state.antragsteller["kammer_strasse"] = st.text_input(
+                "Straße der Kammer",
+                value=st.session_state.antragsteller.get("kammer_strasse", ""),
+                placeholder="Littenstraße 9",
+                key="antrag_kammer_strasse"
+            )
+            st.session_state.antragsteller["kammer_plz_ort"] = st.text_input(
+                "PLZ Ort der Kammer",
+                value=st.session_state.antragsteller.get("kammer_plz_ort", ""),
+                placeholder="10179 Berlin",
+                key="antrag_kammer_plz"
+            )
+
+            st.markdown("**Fachanwaltslehrgang:**")
+            st.session_state.antragsteller["lehrgang_info"] = st.text_input(
+                "Lehrgangsbezeichnung",
+                value=st.session_state.antragsteller.get("lehrgang_info", ""),
+                placeholder=f"Fachanwaltslehrgang {fachgebiet} der DAA",
+                key="antrag_lehrgang"
+            )
+            st.session_state.antragsteller["lehrgang_datum"] = st.text_input(
+                "Abschlussdatum Lehrgang",
+                value=st.session_state.antragsteller.get("lehrgang_datum", ""),
+                placeholder="15.10.2024",
+                key="antrag_lehrgang_datum"
+            )
+
+        # Klausuren-Bereich
+        st.markdown("---")
+        st.subheader("Bestandene Klausuren")
+
+        # Bestehende Klausuren anzeigen
+        if st.session_state.klausuren:
+            for i, klausur in enumerate(st.session_state.klausuren):
+                klausur_col1, klausur_col2, klausur_col3, klausur_col4 = st.columns([3, 2, 2, 1])
+                with klausur_col1:
+                    st.text(f"📝 {klausur['bezeichnung']}")
+                with klausur_col2:
+                    st.text(klausur['datum'])
+                with klausur_col3:
+                    st.text(klausur['ergebnis'])
+                with klausur_col4:
+                    if st.button("🗑️", key=f"del_klausur_{i}"):
+                        st.session_state.klausuren.pop(i)
+                        st.rerun()
+
+        # Neue Klausur hinzufügen
+        st.markdown("**Neue Klausur hinzufügen:**")
+        new_klausur_col1, new_klausur_col2, new_klausur_col3 = st.columns([3, 2, 2])
+
+        with new_klausur_col1:
+            new_klausur_bez = st.text_input(
+                "Klausurbezeichnung",
+                placeholder=f"Klausur 1: Materielles {fachgebiet}",
+                key="new_klausur_bez"
+            )
+        with new_klausur_col2:
+            new_klausur_datum = st.text_input(
+                "Datum",
+                placeholder="15.09.2024",
+                key="new_klausur_datum"
+            )
+        with new_klausur_col3:
+            new_klausur_ergebnis = st.selectbox(
+                "Ergebnis",
+                ["bestanden", "gut bestanden", "sehr gut bestanden", "mit Auszeichnung bestanden"],
+                key="new_klausur_ergebnis"
+            )
+
+        if st.button("➕ Klausur hinzufügen", key="add_klausur"):
+            if new_klausur_bez and new_klausur_datum:
+                st.session_state.klausuren.append({
+                    "bezeichnung": new_klausur_bez,
+                    "datum": new_klausur_datum,
+                    "ergebnis": new_klausur_ergebnis
+                })
+                st.success(f"✓ Klausur '{new_klausur_bez}' hinzugefügt!")
+                st.rerun()
+            else:
+                st.warning("Bitte Bezeichnung und Datum eingeben.")
+
+    # Antragsschreiben generieren
+    if DOCX_AVAILABLE:
+        # Bereichsverteilung berechnen
+        bereich_counts = summary.get("bereich_counts", {})
+
+        # Prüfen ob genug Daten vorhanden
+        antragsteller_komplett = all([
+            st.session_state.antragsteller.get("name"),
+            st.session_state.antragsteller.get("kammer_name"),
+            st.session_state.antragsteller.get("zulassung_datum")
+        ])
+
+        if antragsteller_komplett and st.session_state.klausuren:
+            try:
+                antrags_bytes = create_antragsschreiben(
+                    antragsteller=st.session_state.antragsteller,
+                    fachgebiet=fachgebiet,
+                    summary=summary,
+                    klausuren=st.session_state.klausuren,
+                    bereich_verteilung=bereich_counts,
+                    fl1_count=len(fl1),
+                    fl2_count=len(fl2)
+                )
+
+                antrags_filename = f"Antrag_Fachanwalt_{fachgebiet.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.docx"
+
+                st.download_button(
+                    label="📝 ANTRAGSSCHREIBEN HERUNTERLADEN (Word)",
+                    data=antrags_bytes,
+                    file_name=antrags_filename,
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    type="primary",
+                    use_container_width=True
+                )
+
+                st.success("✓ Antragsschreiben bereit zum Download!")
+
+            except Exception as e:
+                st.error(f"Fehler bei der Erstellung: {str(e)}")
+        else:
+            missing = []
+            if not st.session_state.antragsteller.get("name"):
+                missing.append("Name")
+            if not st.session_state.antragsteller.get("kammer_name"):
+                missing.append("Rechtsanwaltskammer")
+            if not st.session_state.antragsteller.get("zulassung_datum"):
+                missing.append("Zulassungsdatum")
+            if not st.session_state.klausuren:
+                missing.append("Klausuren")
+
+            st.info(f"📋 Bitte ergänzen Sie: {', '.join(missing)}")
+            st.caption("Öffnen Sie den Bereich 'Antragsteller-Daten eingeben' oben, um die Daten zu erfassen.")
+    else:
+        st.warning("Word-Export benötigt: `pip install python-docx`")
 
 
 if __name__ == "__main__":
